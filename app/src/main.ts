@@ -14,6 +14,11 @@ import { SERVER_CONFIG, validateConfig } from './utils/config';
 
 // Protocol scheme for deep links
 const PROTOCOL_SCHEME = 'daydream-scope';
+const DEFAULT_RENDERER_DEV_URL = 'http://localhost:5173';
+
+function getRendererDevUrl(): string {
+  return process.env.VITE_DEV_SERVER_URL || DEFAULT_RENDERER_DEV_URL;
+}
 
 /**
  * Deep link data types
@@ -801,7 +806,7 @@ function configureProcessSecurity(): void {
         // Check if it's an external URL (not localhost or the server)
         const allowedOrigins = [SERVER_CONFIG.url];
         if (!app.isPackaged) {
-          allowedOrigins.push('http://localhost:5173');
+          allowedOrigins.push(getRendererDevUrl());
         }
 
         const isExternal = !allowedOrigins.some(origin => {
@@ -835,7 +840,7 @@ function configureProcessSecurity(): void {
         // Allow localhost/dev server in development
         const allowedOrigins = [SERVER_CONFIG.url];
         if (!app.isPackaged) {
-          allowedOrigins.push('http://localhost:5173');
+          allowedOrigins.push(getRendererDevUrl());
         }
 
         const isAllowed = allowedOrigins.some(origin => parsedUrl.origin === origin);

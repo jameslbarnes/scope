@@ -29,6 +29,7 @@ const COLORS = {
 const LOG_LINE_LIMIT = 500;
 
 const ALLOWED_HOSTS = ['127.0.0.1', 'localhost', SERVER_CONFIG.host];
+const DEFAULT_RENDERER_DEV_URL = 'http://localhost:5173';
 
 export class ScopeElectronAppService {
   private appState: AppState;
@@ -251,7 +252,7 @@ export class ScopeElectronAppService {
       logger.info(`Loading from file: ${indexPath}`);
       mainWindow.loadFile(indexPath);
     } else {
-      const devUrl = 'http://localhost:5173';
+      const devUrl = process.env.VITE_DEV_SERVER_URL || DEFAULT_RENDERER_DEV_URL;
       logger.info(`Loading from dev server: ${devUrl}`);
       mainWindow.loadURL(devUrl).catch((err) => {
         logger.error(`Failed to load ${devUrl}:`, err);

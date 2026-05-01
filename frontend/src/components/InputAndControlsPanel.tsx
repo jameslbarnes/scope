@@ -345,7 +345,7 @@ export function InputAndControlsPanel({
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="text">Text</SelectItem>
+                <SelectItem value="text">Generation</SelectItem>
                 <SelectItem value="video">Video</SelectItem>
               </SelectContent>
             </Select>

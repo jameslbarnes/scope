@@ -6,7 +6,7 @@
  * all components see the updated value immediately.
  *
  * Polling is smart and based on current status:
- * - Disconnected: no polling (state changes only via explicit user actions)
+ * - Disconnected: slow polling to catch backend state changed outside React
  * - Connecting: poll every 1s to quickly detect when connection completes
  * - Connected: poll every 5s to detect unexpected disconnection
  */
@@ -31,6 +31,8 @@ export interface CloudStatus {
   last_close_code: number | null;
   last_close_reason: string | null;
   connect_stage: string | null;
+  backend: string | null;
+  remote_url: string | null;
 }
 
 const DEFAULT_STATUS: CloudStatus = {
@@ -43,9 +45,12 @@ const DEFAULT_STATUS: CloudStatus = {
   last_close_code: null,
   last_close_reason: null,
   connect_stage: null,
+  backend: null,
+  remote_url: null,
 };
 
 // Polling intervals based on connection state
+const DISCONNECTED_POLL_INTERVAL = 10000; // 10s - catch CLI/backend initiated connects
 const CONNECTING_POLL_INTERVAL = 1000; // 1s - fast polling while waiting for connection
 const CONNECTED_POLL_INTERVAL = 5000; // 5s - slow polling to detect unexpected disconnection
 
@@ -106,8 +111,11 @@ export function CloudStatusProvider({ children }: CloudStatusProviderProps) {
     } else if (status.connected) {
       // Slow polling while connected to detect unexpected disconnection
       pollInterval = CONNECTED_POLL_INTERVAL;
+    } else {
+      // Slow polling while disconnected catches backend-initiated connects,
+      // including desktop dev sessions configured through the local API.
+      pollInterval = DISCONNECTED_POLL_INTERVAL;
     }
-    // When disconnected: no polling - state only changes via explicit actions
 
     if (pollInterval) {
       intervalRef.current = window.setInterval(fetchStatus, pollInterval);

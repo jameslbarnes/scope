@@ -57,6 +57,7 @@ import type {
   LoraMergeStrategy,
   DownloadProgress,
   SettingsState,
+  PipelineInfo,
 } from "../types";
 import type {
   PromptItem,
@@ -167,6 +168,73 @@ function graphHasOnlyServerSideSources(graph: GraphConfig | null): boolean {
   return sources.every(n => !isBrowserSourceMode(n.source_mode || "video"));
 }
 
+const LEGACY_LONGLIVE_FOUR_STEP_DENOISING = [1000, 750, 500, 250];
+const LEGACY_LONGLIVE_THREE_STEP_DENOISING = [1000, 750, 500];
+const LEGACY_LONGLIVE_TWO_STEP_DENOISING = [1000, 750];
+const LONGLIVE_ETHEREA_DENOISING = [1000, 875, 750];
+
+function numberArraysEqual(a?: number[], b?: number[]): boolean {
+  if (!a || !b || a.length !== b.length) return false;
+  return a.every((value, index) => value === b[index]);
+}
+
+function normalizeDenoisingStepsForRun(
+  pipelineId: string,
+  steps: number[] | undefined,
+  defaults: number[] | undefined
+): number[] {
+  if (pipelineId === "longlive") {
+    const configuredSteps = steps ?? defaults;
+    if (
+      !configuredSteps ||
+      numberArraysEqual(
+        configuredSteps,
+        LEGACY_LONGLIVE_TWO_STEP_DENOISING
+      ) ||
+      numberArraysEqual(
+        configuredSteps,
+        LEGACY_LONGLIVE_THREE_STEP_DENOISING
+      ) ||
+      numberArraysEqual(
+        configuredSteps,
+        LEGACY_LONGLIVE_FOUR_STEP_DENOISING
+      )
+    ) {
+      return LONGLIVE_ETHEREA_DENOISING;
+    }
+    return configuredSteps;
+  }
+  return steps ?? defaults ?? [700, 500];
+}
+
+function schemaLoadParamDefaults(
+  configSchema: PipelineInfo["configSchema"] | undefined
+): Record<string, unknown> {
+  const properties = configSchema?.properties ?? {};
+  const defaults: Record<string, unknown> = {};
+  const controlledKeys = new Set([
+    "height",
+    "width",
+    "denoising_steps",
+    "noise_scale",
+    "noise_controller",
+    "loras",
+    "lora_merge_strategy",
+    "lora_merge_mode",
+    "quantization",
+    "vace_enabled",
+    "vace_context_scale",
+  ]);
+
+  for (const [key, prop] of Object.entries(properties)) {
+    if (controlledKeys.has(key)) continue;
+    if (prop.ui?.is_load_param !== true) continue;
+    if (prop.default === undefined || prop.default === null) continue;
+    defaults[key] = prop.default;
+  }
+  return defaults;
+}
+
 export function StreamPage() {
   // Onboarding state
   const { state: onboardingState, isOverlayVisible: showOnboardingOverlay } =
@@ -190,6 +258,7 @@ export function StreamPage() {
     isConnecting: isBackendCloudConnecting,
     connectStage: cloudConnectStage,
     refresh: refreshCloudStatus,
+    status: cloudStatus,
   } = useCloudStatus();
 
   const { loraFiles } = useLoRAsContext();
@@ -558,7 +627,60 @@ export function StreamPage() {
     pipelineInfo,
     pipelineInfoRef,
     loadingStage: pipelineLoadingStage,
+    checkStatus: checkPipelineStatus,
   } = usePipeline();
+
+  useEffect(() => {
+    if (!isBackendCloudConnected || cloudStatus.backend !== "remote_scope") {
+      return;
+    }
+    void checkPipelineStatus();
+  }, [
+    isBackendCloudConnected,
+    cloudStatus.backend,
+    cloudStatus.connection_id,
+    checkPipelineStatus,
+  ]);
+
+  useEffect(() => {
+    if (
+      !isBackendCloudConnected ||
+      cloudStatus.backend !== "remote_scope" ||
+      pipelineInfo?.status !== "loaded" ||
+      !pipelineInfo.pipeline_id
+    ) {
+      return;
+    }
+
+    const loadedHeight = pipelineInfo.load_params?.height;
+    const loadedWidth = pipelineInfo.load_params?.width;
+    if (typeof loadedHeight !== "number" || typeof loadedWidth !== "number") {
+      return;
+    }
+
+    const graph = graphEditorRef.current?.getCurrentGraphConfig();
+    const node = graph?.nodes.find(
+      n => n.type === "pipeline" && n.pipeline_id === pipelineInfo.pipeline_id
+    );
+    if (!node) return;
+
+    const nodeParams = graph?.ui_state?.node_params as
+      | Record<string, Record<string, unknown>>
+      | undefined;
+    const bag = nodeParams?.[node.id];
+    if (typeof bag?.height !== "number") {
+      graphEditorRef.current?.updateNodeParam(node.id, "height", loadedHeight);
+    }
+    if (typeof bag?.width !== "number") {
+      graphEditorRef.current?.updateNodeParam(node.id, "width", loadedWidth);
+    }
+  }, [
+    isBackendCloudConnected,
+    cloudStatus.backend,
+    pipelineInfo?.status,
+    pipelineInfo?.pipeline_id,
+    pipelineInfo?.load_params,
+  ]);
 
   // Tempo sync
   const {
@@ -863,9 +985,168 @@ export function StreamPage() {
   // toggles so the stock test.mp4 doesn't silently replace it.
   const nodeVideoSourcesRef = useRef<Record<string, string | File>>({});
 
+  // Track per-node sample video cycle index. After init this holds the index
+  // currently shown so the next cycle advances to the following sample.
+  const nodeSampleVideoIndexRef = useRef<Record<string, number>>({});
+  // Track per-node <video> elements and capture intervals so we can clean up
+  // previous source streams on each cycle/reload.
+  const nodeVideoElementsRef = useRef<Record<string, HTMLVideoElement>>({});
+  const nodeVideoIntervalsRef = useRef<Record<string, number>>({});
+  const nodeVideoObjectUrlsRef = useRef<Record<string, string>>({});
+  // Track in-flight init calls so a re-render doesn't kick off duplicate loads
+  const nodeInitInFlightRef = useRef<Set<string>>(new Set());
+
   // Shared camera stream ref so multiple source nodes (or repeated mode
   // switches) reuse the same getUserMedia stream instead of prompting again.
   const sharedCameraStreamRef = useRef<MediaStream | null>(null);
+
+  const cleanupNodeVideoElement = useCallback((nodeId: string) => {
+    const intervalId = nodeVideoIntervalsRef.current[nodeId];
+    if (intervalId !== undefined) {
+      window.clearInterval(intervalId);
+      delete nodeVideoIntervalsRef.current[nodeId];
+    }
+
+    const oldVideo = nodeVideoElementsRef.current[nodeId];
+    if (oldVideo) {
+      oldVideo.pause();
+      oldVideo.removeAttribute("src");
+      oldVideo.load();
+      delete nodeVideoElementsRef.current[nodeId];
+    }
+
+    const objectUrl = nodeVideoObjectUrlsRef.current[nodeId];
+    if (objectUrl) {
+      URL.revokeObjectURL(objectUrl);
+      delete nodeVideoObjectUrlsRef.current[nodeId];
+    }
+  }, []);
+
+  const createVideoStreamForNode = useCallback(
+    async (nodeId: string, videoSource: string | File): Promise<MediaStream> => {
+      cleanupNodeVideoElement(nodeId);
+
+      const video = document.createElement("video");
+      let sourceUrl: string;
+      if (typeof videoSource === "string") {
+        sourceUrl = videoSource;
+      } else {
+        const objectUrl = URL.createObjectURL(videoSource);
+        nodeVideoObjectUrlsRef.current[nodeId] = objectUrl;
+        sourceUrl = objectUrl;
+      }
+      video.loop = true;
+      video.muted = true;
+      video.playsInline = true;
+      video.autoplay = true;
+
+      await new Promise<void>((resolve, reject) => {
+        const timeout = window.setTimeout(() => {
+          reject(new Error("Video loading timeout"));
+        }, 10000);
+        video.onloadedmetadata = () => {
+          window.clearTimeout(timeout);
+          resolve();
+        };
+        video.onerror = () => {
+          window.clearTimeout(timeout);
+          reject(new Error("Failed to load video source"));
+        };
+        video.src = sourceUrl;
+        video.load();
+      });
+
+      await video.play();
+
+      const width = video.videoWidth || 512;
+      const height = video.videoHeight || 512;
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) {
+        throw new Error("Could not create source capture canvas");
+      }
+
+      const stream = canvas.captureStream(0);
+      const videoTrack = stream.getVideoTracks()[0];
+      const drawFrame = () => {
+        if (video.paused || video.ended) return;
+        ctx.drawImage(video, 0, 0, width, height);
+        if (
+          videoTrack &&
+          "requestFrame" in videoTrack &&
+          videoTrack.readyState === "live"
+        ) {
+          (
+            videoTrack as MediaStreamTrack & { requestFrame: () => void }
+          ).requestFrame();
+        }
+      };
+
+      drawFrame();
+      const intervalId = window.setInterval(drawFrame, 1000 / FPS);
+      nodeVideoIntervalsRef.current[nodeId] = intervalId;
+      videoTrack?.addEventListener("ended", () => {
+        window.clearInterval(intervalId);
+      });
+      nodeVideoElementsRef.current[nodeId] = video;
+
+      return stream;
+    },
+    [cleanupNodeVideoElement]
+  );
+
+  const refreshBrowserSourceStreamsForRun = useCallback(
+    async (graph: GraphConfig): Promise<Record<string, MediaStream>> => {
+      const nextStreams = { ...nodeLocalStreamsRef.current };
+      const sourceNodes = graph.nodes.filter(
+        n => n.type === "source" && isBrowserSourceMode(n.source_mode || "video")
+      );
+
+      for (const node of sourceNodes) {
+        const sourceMode = node.source_mode || "video";
+        const oldStream = nextStreams[node.id];
+        if (oldStream) {
+          oldStream.getTracks().forEach(t => t.stop());
+          delete nextStreams[node.id];
+        }
+
+        if (sourceMode === "video") {
+          const source =
+            nodeVideoSourcesRef.current[node.id] ??
+            SAMPLE_VIDEOS[
+              nodeSampleVideoIndexRef.current[node.id] ?? 0
+            ] ??
+            SAMPLE_VIDEOS[0];
+          const stream = await createVideoStreamForNode(node.id, source);
+          nextStreams[node.id] = stream;
+          nodeVideoSourcesRef.current[node.id] = source;
+        } else if (sourceMode === "camera") {
+          cleanupNodeVideoElement(node.id);
+          if (sharedCameraStreamRef.current) {
+            sharedCameraStreamRef.current.getTracks().forEach(t => t.stop());
+            sharedCameraStreamRef.current = null;
+          }
+          const stream = await navigator.mediaDevices.getUserMedia({
+            video: {
+              width: { ideal: 512, min: 256, max: 512 },
+              height: { ideal: 512, min: 256, max: 512 },
+              frameRate: { ideal: FPS, min: MIN_FPS, max: MAX_FPS },
+            },
+            audio: false,
+          });
+          sharedCameraStreamRef.current = stream;
+          nextStreams[node.id] = stream;
+        }
+      }
+
+      nodeLocalStreamsRef.current = nextStreams;
+      setNodeLocalStreams(nextStreams);
+      return nextStreams;
+    },
+    [cleanupNodeVideoElement, createVideoStreamForNode]
+  );
 
   // Create (or reuse) a camera stream for a specific source node
   const createCameraStreamForNode = useCallback(async (nodeId: string) => {
@@ -930,25 +1211,14 @@ export function StreamPage() {
       if (newMode === "video" && isStreaming) {
         const currentIndex = nodeSampleVideoIndexRef.current[nodeId] ?? 0;
         const nextUrl = SAMPLE_VIDEOS[currentIndex % SAMPLE_VIDEOS.length];
-        const oldVideo = nodeVideoElementsRef.current[nodeId];
-        if (oldVideo) {
-          oldVideo.pause();
-          oldVideo.removeAttribute("src");
-          oldVideo.load();
+        const oldStream = nodeLocalStreamsRef.current[nodeId];
+        if (oldStream) {
+          oldStream.getTracks().forEach(t => t.stop());
         }
-        const video = document.createElement("video");
-        video.src = nextUrl;
-        video.loop = true;
-        video.muted = true;
-        video.playsInline = true;
-        video
-          .play()
-          .then(() => {
-            nodeVideoElementsRef.current[nodeId] = video;
-            const stream = (
-              video as HTMLVideoElement & { captureStream(): MediaStream }
-            ).captureStream();
+        createVideoStreamForNode(nodeId, nextUrl)
+          .then(stream => {
             setNodeLocalStreams(prev => ({ ...prev, [nodeId]: stream }));
+            nodeVideoSourcesRef.current[nodeId] = nextUrl;
           })
           .catch(e => {
             console.error(
@@ -959,7 +1229,7 @@ export function StreamPage() {
       }
       // For spout/ndi/syphon, no local stream needed (server-side)
     },
-    [switchMode, createCameraStreamForNode, isStreaming]
+    [switchMode, createCameraStreamForNode, createVideoStreamForNode, isStreaming]
   );
 
   // Handle per-node video file upload in graph mode
@@ -969,19 +1239,11 @@ export function StreamPage() {
         return handleVideoFileUpload(file);
       }
       try {
-        const video = document.createElement("video");
-        video.src = URL.createObjectURL(file);
-        video.loop = true;
-        video.muted = true;
-        video.playsInline = true;
-        await video.play();
-        const stream = (
-          video as HTMLVideoElement & { captureStream(): MediaStream }
-        ).captureStream();
         const oldStream = nodeLocalStreamsRef.current[nodeId];
         if (oldStream) {
           oldStream.getTracks().forEach(t => t.stop());
         }
+        const stream = await createVideoStreamForNode(nodeId, file);
         setNodeLocalStreams(prev => ({ ...prev, [nodeId]: stream }));
         // Remember the user's upload so Graph → Perform can replay it instead
         // of resetting to the default sample.
@@ -992,16 +1254,8 @@ export function StreamPage() {
         return false;
       }
     },
-    [handleVideoFileUpload]
+    [handleVideoFileUpload, createVideoStreamForNode]
   );
-
-  // Track per-node sample video cycle index. After init this holds the index
-  // currently shown so the next cycle advances to the following sample.
-  const nodeSampleVideoIndexRef = useRef<Record<string, number>>({});
-  // Track per-node <video> elements so we can clean up the previous one on each cycle
-  const nodeVideoElementsRef = useRef<Record<string, HTMLVideoElement>>({});
-  // Track in-flight init calls so a re-render doesn't kick off duplicate loads
-  const nodeInitInFlightRef = useRef<Set<string>>(new Set());
 
   // Handle per-node sample video cycling in graph mode
   const handlePerNodeCycleSampleVideo = useCallback(
@@ -1019,30 +1273,14 @@ export function StreamPage() {
         if (oldStream) {
           oldStream.getTracks().forEach(t => t.stop());
         }
-        // Clean up previous video element to avoid leaking decode resources
-        const oldVideo = nodeVideoElementsRef.current[nodeId];
-        if (oldVideo) {
-          oldVideo.pause();
-          oldVideo.removeAttribute("src");
-          oldVideo.load();
-        }
-        const video = document.createElement("video");
-        video.src = nextUrl;
-        video.loop = true;
-        video.muted = true;
-        video.playsInline = true;
-        await video.play();
-        nodeVideoElementsRef.current[nodeId] = video;
-        const stream = (
-          video as HTMLVideoElement & { captureStream(): MediaStream }
-        ).captureStream();
+        const stream = await createVideoStreamForNode(nodeId, nextUrl);
         setNodeLocalStreams(prev => ({ ...prev, [nodeId]: stream }));
         nodeVideoSourcesRef.current[nodeId] = nextUrl;
       } catch (e) {
         console.error(`Failed to cycle sample video for node ${nodeId}:`, e);
       }
     },
-    [cycleSampleVideo]
+    [cycleSampleVideo, createVideoStreamForNode]
   );
 
   // Initialize a per-node sample video stream with the first sample (test.mp4).
@@ -1056,25 +1294,8 @@ export function StreamPage() {
     nodeInitInFlightRef.current.add(nodeId);
     try {
       const url = SAMPLE_VIDEOS[0];
-      const video = document.createElement("video");
-      video.src = url;
-      video.loop = true;
-      video.muted = true;
-      video.playsInline = true;
-      await video.play();
-      // Clean up any prior element (defensive — shouldn't happen since
-      // we only init when there's no stream, but be safe)
-      const oldVideo = nodeVideoElementsRef.current[nodeId];
-      if (oldVideo) {
-        oldVideo.pause();
-        oldVideo.removeAttribute("src");
-        oldVideo.load();
-      }
-      nodeVideoElementsRef.current[nodeId] = video;
       nodeSampleVideoIndexRef.current[nodeId] = 0;
-      const stream = (
-        video as HTMLVideoElement & { captureStream(): MediaStream }
-      ).captureStream();
+      const stream = await createVideoStreamForNode(nodeId, url);
       setNodeLocalStreams(prev => ({ ...prev, [nodeId]: stream }));
       nodeVideoSourcesRef.current[nodeId] = url;
     } catch (e) {
@@ -1082,7 +1303,7 @@ export function StreamPage() {
     } finally {
       nodeInitInFlightRef.current.delete(nodeId);
     }
-  }, []);
+  }, [createVideoStreamForNode]);
 
   // Track the last stream track ID sent per node so we only call
   // updateSourceNodeTrack when the track actually changed.
@@ -2402,6 +2623,9 @@ export function StreamPage() {
       let graphConfigForStream: ReturnType<
         NonNullable<typeof graphEditorRef.current>["getCurrentGraphConfig"]
       > | null = null;
+      let nodeLocalStreamsForStream = nodeLocalStreams;
+      const isRemoteScopeBackend =
+        isBackendCloudConnected && cloudStatus.backend === "remote_scope";
 
       if (graphMode || nonLinearGraph) {
         try {
@@ -2626,12 +2850,16 @@ export function StreamPage() {
 
       // Use settings.resolution if available, otherwise fall back to videoResolution
       let resolution = settings.resolution || videoResolution;
+      let useRemoteImplicitResolution = false;
 
       // In graph mode, prefer the pipeline node's height/width over
       // settings.resolution (which may be stale from a previous pipeline/mode).
-      // Falls back to schema defaults for any dimension not explicitly set.
-      if ((graphMode || nonLinearGraph) && graphConfigForStream?.ui_state) {
-        const nParams = graphConfigForStream.ui_state.node_params as
+      // Falls back to schema defaults for local execution. In remote Scope mode,
+      // do not promote local schema defaults into explicit load params: older
+      // pods may use a different tuned runtime default, and sending 512x512 here
+      // would force the remote pipeline to reload at the wrong resolution.
+      if ((graphMode || nonLinearGraph) && graphConfigForStream) {
+        const nParams = graphConfigForStream.ui_state?.node_params as
           | Record<string, Record<string, unknown>>
           | undefined;
         if (nParams) {
@@ -2640,15 +2868,23 @@ export function StreamPage() {
           );
           const mainBag = mainNode ? nParams[mainNode.id] : undefined;
           const schemaDefaults = getDefaults(pipelineIdToUse, currentMode);
-          const h =
-            typeof mainBag?.height === "number"
-              ? Math.round(mainBag.height)
+          const hasExplicitHeight = typeof mainBag?.height === "number";
+          const hasExplicitWidth = typeof mainBag?.width === "number";
+          if (hasExplicitHeight || hasExplicitWidth || !isRemoteScopeBackend) {
+            const h = hasExplicitHeight
+              ? Math.round(mainBag.height as number)
               : schemaDefaults.height;
-          const w =
-            typeof mainBag?.width === "number"
-              ? Math.round(mainBag.width)
+            const w = hasExplicitWidth
+              ? Math.round(mainBag.width as number)
               : schemaDefaults.width;
-          resolution = { height: h, width: w };
+            resolution = { height: h, width: w };
+          } else {
+            useRemoteImplicitResolution = true;
+            resolution = null;
+          }
+        } else if (isRemoteScopeBackend) {
+          useRemoteImplicitResolution = true;
+          resolution = null;
         }
       }
 
@@ -2667,18 +2903,35 @@ export function StreamPage() {
       // Build load parameters dynamically based on pipeline capabilities and settings
       // The backend will use only the parameters it needs based on the pipeline schema
       const currentPipeline = pipelines?.[pipelineIdToUse];
+      const modeDefaultsForStream = getDefaults(pipelineIdToUse, currentMode);
+      const denoisingStepsForStream = normalizeDenoisingStepsForRun(
+        pipelineIdToUse,
+        settings.denoisingSteps,
+        modeDefaultsForStream.denoisingSteps
+      );
+      if (
+        !numberArraysEqual(settings.denoisingSteps, denoisingStepsForStream)
+      ) {
+        updateSettings({ denoisingSteps: denoisingStepsForStream });
+      }
       // Compute VACE enabled state - needed for both loadParams and initialParameters
       const vaceEnabled = currentPipeline?.supportsVACE
-        ? (settings.vaceEnabled ?? currentMode !== "video")
+        ? (settings.vaceEnabled ?? true)
         : false;
 
       let loadParams: Record<string, unknown> | null = null;
 
-      if (resolution) {
+      if (resolution || useRemoteImplicitResolution) {
         // Start with common parameters
+        loadParams = {};
+        if (resolution) {
+          loadParams.height = resolution.height;
+          loadParams.width = resolution.width;
+        }
+
         loadParams = {
-          height: resolution.height,
-          width: resolution.width,
+          ...schemaLoadParamDefaults(currentPipeline?.configSchema),
+          ...loadParams,
         };
 
         // Add quantization when pipeline supports it
@@ -2746,7 +2999,11 @@ export function StreamPage() {
         }
 
         console.log(
-          `Loading ${pipelineIds.length} pipeline(s) (${pipelineIds.join(", ")}) with resolution ${resolution.width}x${resolution.height}`,
+          `Loading ${pipelineIds.length} pipeline(s) (${pipelineIds.join(", ")}) with resolution ${
+            resolution
+              ? `${resolution.width}x${resolution.height}`
+              : "remote/default"
+          }`,
           loadParams
         );
       }
@@ -2779,7 +3036,8 @@ export function StreamPage() {
             pipelineIdToUse,
             settings.preprocessorIds ?? [],
             settings.postprocessorIds ?? [],
-            vaceInputVideoIds.size > 0 ? vaceInputVideoIds : undefined
+            vaceInputVideoIds.size > 0 ? vaceInputVideoIds : undefined,
+            currentMode
           ),
           settings.inputSource
         );
@@ -2795,6 +3053,43 @@ export function StreamPage() {
             .filter(n => n.type === "record")
             .map(n => n.id)
         );
+      }
+
+      if ((graphMode || nonLinearGraph) && graphConfigForStream) {
+        nodeLocalStreamsForStream =
+          await refreshBrowserSourceStreamsForRun(graphConfigForStream);
+      }
+
+      // Check video requirements before loading so Run fails fast if the graph
+      // has no browser-side source stream ready to send.
+      const needsVideoInput = currentMode === "video";
+      const isSpoutMode =
+        mode === "spout" && settings.inputSource?.source_type === "spout";
+      const isNdiMode =
+        mode === "ndi" && settings.inputSource?.source_type === "ndi";
+      const isSyphonMode =
+        mode === "syphon" && settings.inputSource?.source_type === "syphon";
+      const isServerSideInput = isSpoutMode || isNdiMode || isSyphonMode;
+      const needsBrowserVideoTrack =
+        needsVideoInput &&
+        (graphMode || nonLinearGraph
+          ? !graphHasOnlyServerSideSources(graphConfigForStream)
+          : !isServerSideInput);
+
+      const streamToSend = needsBrowserVideoTrack
+        ? localStream || undefined
+        : undefined;
+
+      const hasPerNodeStreams =
+        graphMode && Object.keys(nodeLocalStreamsForStream).length > 0;
+      if (needsBrowserVideoTrack && !localStream && !hasPerNodeStreams) {
+        console.error("Video input required but no local stream available");
+        toast.error("Video input unavailable", {
+          description:
+            "Select a video or camera source, or wait for the source preview to load before running the graph.",
+          duration: 6000,
+        });
+        return false;
       }
 
       // Build PipelineLoadItem[] from graph nodes (always available at this
@@ -2875,7 +3170,7 @@ export function StreamPage() {
                     (e.to_port === "vace_input_frames" ||
                       e.to_port === "vace_input_masks")
                 );
-                nodeLoadParams.vace_enabled = hasVaceEdge;
+                nodeLoadParams.vace_enabled = hasVaceEdge || vaceEnabled;
                 const nodeVaceScale = nodeBag?.vace_context_scale;
                 nodeLoadParams.vace_context_scale =
                   typeof nodeVaceScale === "number"
@@ -2919,32 +3214,6 @@ export function StreamPage() {
         }
       }
 
-      // Check video requirements based on input mode.
-      const needsVideoInput = currentMode === "video";
-      const isSpoutMode =
-        mode === "spout" && settings.inputSource?.source_type === "spout";
-      const isNdiMode =
-        mode === "ndi" && settings.inputSource?.source_type === "ndi";
-      const isSyphonMode =
-        mode === "syphon" && settings.inputSource?.source_type === "syphon";
-      const isServerSideInput = isSpoutMode || isNdiMode || isSyphonMode;
-      const needsBrowserVideoTrack =
-        needsVideoInput &&
-        (graphMode || nonLinearGraph
-          ? !graphHasOnlyServerSideSources(graphConfigForStream)
-          : !isServerSideInput);
-
-      const streamToSend = needsBrowserVideoTrack
-        ? localStream || undefined
-        : undefined;
-
-      const hasPerNodeStreams =
-        graphMode && Object.keys(nodeLocalStreams).length > 0;
-      if (needsBrowserVideoTrack && !localStream && !hasPerNodeStreams) {
-        console.error("Video input required but no local stream available");
-        return false;
-      }
-
       // Build initial parameters based on pipeline type
       const initialParameters: {
         input_mode?: "text" | "video";
@@ -2984,9 +3253,7 @@ export function StreamPage() {
       if (currentPipeline?.supportsPrompts !== false) {
         initialParameters.prompts = promptItems;
         initialParameters.prompt_interpolation_method = interpolationMethod;
-        initialParameters.denoising_step_list = settings.denoisingSteps || [
-          700, 500,
-        ];
+        initialParameters.denoising_step_list = denoisingStepsForStream;
       }
 
       // In graph mode, use the graph node's prompt instead of perform mode defaults
@@ -3171,6 +3438,18 @@ export function StreamPage() {
             ]);
             for (const [key, value] of Object.entries(mainNodeParams)) {
               if (
+                (key === "denoising_steps" || key === "denoising_step_list") &&
+                Array.isArray(value)
+              ) {
+                initialParameters.denoising_step_list =
+                  normalizeDenoisingStepsForRun(
+                    pipelineIdToUse,
+                    value.filter((item): item is number => typeof item === "number"),
+                    modeDefaultsForStream.denoisingSteps
+                  );
+                continue;
+              }
+              if (
                 value !== undefined &&
                 !SKIP_PARAMS.has(key) &&
                 !key.startsWith("__")
@@ -3197,7 +3476,7 @@ export function StreamPage() {
         if (webrtcSourceNodes.length > 0) {
           const streams: Record<string, MediaStream> = {};
           for (const node of webrtcSourceNodes) {
-            const nodeStream = nodeLocalStreams[node.id];
+            const nodeStream = nodeLocalStreamsForStream[node.id];
             if (nodeStream) {
               streams[node.id] = nodeStream;
             } else if (localStream) {
@@ -3263,6 +3542,13 @@ export function StreamPage() {
       return true; // Stream started successfully
     } catch (error) {
       console.error("Error during stream start:", error);
+      toast.error("Could not start stream", {
+        description:
+          error instanceof Error
+            ? error.message
+            : "An unexpected error occurred while starting the stream.",
+        duration: 6000,
+      });
       return false;
     }
   };
@@ -3409,7 +3695,9 @@ export function StreamPage() {
                   linearGraphFromSettings(
                     settings.pipelineId,
                     settings.preprocessorIds ?? [],
-                    settings.postprocessorIds ?? []
+                    settings.postprocessorIds ?? [],
+                    undefined,
+                    settings.inputMode ?? "text"
                   ),
                   settings.inputSource
                 );
@@ -3454,17 +3742,16 @@ export function StreamPage() {
                   }
 
                   const sourceNode = graphNodes.find(n => n.type === "source");
-                  // Default to "video" if source node has no explicit mode
-                  const sourceMode = sourceNode?.source_mode || "video";
-
-                  // Sync inputMode setting so perform mode reflects the graph's choice
-                  const inputMode: InputMode =
-                    sourceMode === "video" || sourceMode === "camera"
-                      ? "video"
-                      : "video"; // server-side sources still use "video" inputMode
+                  // A graph with no Source node is text-to-video generation.
+                  // Any Source node, including server-side sources, means the
+                  // pipeline needs video input in Perform mode.
+                  const sourceMode = sourceNode
+                    ? sourceNode.source_mode || "video"
+                    : undefined;
+                  const inputMode: InputMode = sourceNode ? "video" : "text";
 
                   // Also sync resolution to match the new input mode so
-                  // perform mode shows the correct video-mode defaults.
+                  // perform mode shows the correct mode-specific defaults.
                   const pid = (firstPipeline?.pipeline_id ??
                     settings.pipelineId) as PipelineId;
                   const modeDefaults = getDefaults(pid, inputMode);
@@ -3480,7 +3767,15 @@ export function StreamPage() {
                   // "camera" is a server-side source (spout/ndi/syphon/
                   // youtube/plugin-registered); mirror its config into
                   // settings.inputSource so perform mode picks it up.
-                  if (!isBrowserSourceMode(sourceMode)) {
+                  if (!sourceMode) {
+                    updateSettings({
+                      inputSource: {
+                        enabled: false,
+                        source_type: "",
+                        source_name: "",
+                      },
+                    });
+                  } else if (!isBrowserSourceMode(sourceMode)) {
                     updateSettings({
                       inputSource: {
                         enabled: true,
@@ -3663,8 +3958,7 @@ export function StreamPage() {
                 onSyphonFlipVerticalChange={handleSyphonFlipVerticalChange}
                 vaceEnabled={
                   settings.vaceEnabled ??
-                  (pipelines?.[settings.pipelineId]?.supportsVACE &&
-                    settings.inputMode !== "video")
+                  Boolean(pipelines?.[settings.pipelineId]?.supportsVACE)
                 }
                 refImages={settings.refImages || []}
                 onRefImagesChange={handleRefImagesChange}
@@ -3984,8 +4278,7 @@ export function StreamPage() {
                 )}
                 vaceEnabled={
                   settings.vaceEnabled ??
-                  (pipelines?.[settings.pipelineId]?.supportsVACE &&
-                    settings.inputMode !== "video")
+                  Boolean(pipelines?.[settings.pipelineId]?.supportsVACE)
                 }
                 onVaceEnabledChange={handleVaceEnabledChange}
                 vaceUseInputVideo={settings.vaceUseInputVideo ?? false}

@@ -7,9 +7,10 @@
  * - Cloud connecting/connected states
  */
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, type ChangeEvent } from "react";
 import { Button } from "../ui/button";
 import { Switch } from "../ui/switch";
+import { Input } from "../ui/input";
 import { Cloud, Copy, Check } from "lucide-react";
 import {
   isAuthenticated,
@@ -20,6 +21,8 @@ import {
 } from "../../lib/auth";
 import { connectToCloud } from "../../lib/cloudApi";
 import { useCloudStatus } from "../../hooks/useCloudStatus";
+
+const REMOTE_SCOPE_URL_KEY = "scope.remoteScopeUrl";
 
 interface DaydreamAccountSectionProps {
   /** Callback to refresh pipeline list after cloud mode toggle */
@@ -45,7 +48,12 @@ export function DaydreamAccountSection({
   const [isDisconnecting, setIsDisconnecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [remoteScopeUrl, setRemoteScopeUrl] = useState(() =>
+    localStorage.getItem(REMOTE_SCOPE_URL_KEY) || ""
+  );
   const prevConnectedRef = useRef(false);
+
+  const hasRemoteScopeUrl = remoteScopeUrl.trim().length > 0;
 
   // Keep auth state in sync with storage changes and ensure display name is populated
   useEffect(() => {
@@ -101,7 +109,9 @@ export function DaydreamAccountSection({
     setError(null);
 
     try {
-      const response = await connectToCloud();
+      const response = await connectToCloud({
+        remoteUrl: hasRemoteScopeUrl ? remoteScopeUrl : undefined,
+      });
 
       if (!response || !response.ok) {
         const data = response ? await response.json() : {};
@@ -161,6 +171,18 @@ export function DaydreamAccountSection({
     }
   };
 
+  const handleRemoteScopeUrlChange = (
+    event: ChangeEvent<HTMLInputElement>
+  ) => {
+    const value = event.target.value;
+    setRemoteScopeUrl(value);
+    if (value.trim()) {
+      localStorage.setItem(REMOTE_SCOPE_URL_KEY, value);
+    } else {
+      localStorage.removeItem(REMOTE_SCOPE_URL_KEY);
+    }
+  };
+
   const handleSignIn = () => {
     redirectToSignIn();
   };
@@ -214,17 +236,33 @@ export function DaydreamAccountSection({
               disabled ||
               isDisconnecting ||
               // Sign-in is only required to *connect*; disconnecting is always allowed
-              (!(status.connected || status.connecting) && !isSignedIn)
+              (!(status.connected || status.connecting) &&
+                !isSignedIn &&
+                !hasRemoteScopeUrl)
             }
             className="data-[state=unchecked]:bg-zinc-600 data-[state=checked]:bg-green-500"
           />
         </div>
         <p className="text-xs text-muted-foreground">
-          Use Daydream Cloud inference for running workflows.
+          Use Daydream Cloud or a self-hosted Scope pod for running workflows.
           {!isSignedIn &&
+            !hasRemoteScopeUrl &&
             !(status.connected || status.connecting) &&
-            " Log in required."}
+            " Log in or enter a pod URL."}
         </p>
+
+        <div className="space-y-1">
+          <Input
+            value={remoteScopeUrl}
+            onChange={handleRemoteScopeUrlChange}
+            placeholder="https://your-scope-pod.example.com"
+            disabled={disabled || status.connected || status.connecting}
+            aria-label="Remote Scope pod URL"
+          />
+          <p className="text-xs text-muted-foreground">
+            Optional self-hosted Scope server. Leave blank to use Daydream Cloud.
+          </p>
+        </div>
 
         {status.connected && status.connection_id && (
           <div className="flex items-center gap-2 pt-1">
@@ -248,6 +286,13 @@ export function DaydreamAccountSection({
               )}
             </Button>
           </div>
+        )}
+
+        {status.connected && status.backend === "remote_scope" && (
+          <p className="text-xs text-muted-foreground">
+            Connected to remote Scope pod
+            {status.remote_url ? `: ${status.remote_url}` : ""}.
+          </p>
         )}
 
         {(error || status.error) && (

@@ -1385,6 +1385,10 @@ export function flowToGraphConfig(
       frontendNodeIds.add(n.id);
       return false;
     }
+    if (n.data.nodeType === "pipeline" && !n.data.pipelineId) {
+      frontendNodeIds.add(n.id);
+      return false;
+    }
     return true;
   });
 
@@ -1650,7 +1654,8 @@ export function linearGraphFromSettings(
   pipelineId: string,
   preprocessorIds: string[],
   postprocessorIds: string[],
-  vaceInputVideoIds?: Set<string>
+  vaceInputVideoIds?: Set<string>,
+  inputMode: "text" | "video" = "video"
 ): GraphConfig {
   const allPipelineIds = [...preprocessorIds, pipelineId, ...postprocessorIds];
   // Generate unique node IDs so duplicate pipeline_ids get distinct nodes
@@ -1662,7 +1667,9 @@ export function linearGraphFromSettings(
   });
 
   const nodes: GraphNode[] = [
-    { id: "input", type: "source", source_mode: "video" },
+    ...(inputMode === "video"
+      ? [{ id: "input", type: "source" as const, source_mode: "video" }]
+      : []),
     ...nodeEntries.map(({ nodeId, pid }) => ({
       id: nodeId,
       type: "pipeline" as const,
@@ -1672,25 +1679,29 @@ export function linearGraphFromSettings(
   ];
 
   const edges: GraphEdge[] = [];
-  let prev = "input";
+  let prev: string | null = inputMode === "video" ? "input" : null;
   for (const { nodeId, pid } of nodeEntries) {
-    const toPort = vaceInputVideoIds?.has(pid) ? "vace_input_frames" : "video";
+    if (prev !== null) {
+      const toPort = vaceInputVideoIds?.has(pid) ? "vace_input_frames" : "video";
+      edges.push({
+        from: prev,
+        from_port: "video",
+        to_node: nodeId,
+        to_port: toPort,
+        kind: "stream",
+      });
+    }
+    prev = nodeId;
+  }
+  if (prev !== null) {
     edges.push({
       from: prev,
       from_port: "video",
-      to_node: nodeId,
-      to_port: toPort,
+      to_node: "output",
+      to_port: "video",
       kind: "stream",
     });
-    prev = nodeId;
   }
-  edges.push({
-    from: prev,
-    from_port: "video",
-    to_node: "output",
-    to_port: "video",
-    kind: "stream",
-  });
 
   return { nodes, edges };
 }

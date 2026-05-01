@@ -27,8 +27,10 @@ interface UseVideoSourceProps {
   }) => void;
 }
 
-// Standardized FPS for both video and camera modes
-export const FPS = 15;
+// Standardized FPS for both video and camera modes.
+// LongLive remote video-to-video output is paced by the source stream, so keep
+// the default aligned with the 30fps realtime path instead of throttling to 15.
+export const FPS = 30;
 export const MIN_FPS = 5;
 export const MAX_FPS = 30;
 

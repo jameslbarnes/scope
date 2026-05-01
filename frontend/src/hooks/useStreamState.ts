@@ -18,12 +18,38 @@ import {
 import { usePipelinesContext } from "../contexts/PipelinesContext";
 
 // Generic fallback defaults used before schemas are loaded.
-// Resolution and denoising steps use conservative values.
+// The default pipeline is LongLive, so keep these aligned with Etherea.
 const BASE_FALLBACK = {
-  height: 320,
-  width: 576,
-  denoisingSteps: [1000, 750, 500, 250] as number[],
+  height: 480,
+  width: 832,
+  denoisingSteps: [1000, 875, 750] as number[],
 };
+
+const LEGACY_LONGLIVE_TWO_STEP_DENOISING = [1000, 750];
+const LEGACY_LONGLIVE_THREE_STEP_DENOISING = [1000, 750, 500];
+const LEGACY_LONGLIVE_FOUR_STEP_DENOISING = [1000, 750, 500, 250];
+const LONGLIVE_ETHEREA_DENOISING = [1000, 875, 750];
+
+function numberArraysEqual(a?: number[], b?: number[]): boolean {
+  if (!a || !b || a.length !== b.length) return false;
+  return a.every((value, index) => value === b[index]);
+}
+
+function normalizeLongLiveDenoisingDefaults(
+  pipelineId: PipelineId,
+  steps?: number[]
+): number[] | undefined {
+  if (pipelineId !== "longlive") return steps;
+  if (
+    !steps ||
+    numberArraysEqual(steps, LEGACY_LONGLIVE_TWO_STEP_DENOISING) ||
+    numberArraysEqual(steps, LEGACY_LONGLIVE_THREE_STEP_DENOISING) ||
+    numberArraysEqual(steps, LEGACY_LONGLIVE_FOUR_STEP_DENOISING)
+  ) {
+    return LONGLIVE_ETHEREA_DENOISING;
+  }
+  return steps;
+}
 
 // Get fallback defaults for a pipeline before schemas are loaded
 function getFallbackDefaults(mode?: InputMode) {
@@ -119,7 +145,10 @@ export function useStreamState() {
         return {
           height,
           width,
-          denoisingSteps,
+          denoisingSteps: normalizeLongLiveDenoisingDefaults(
+            pipelineId,
+            denoisingSteps
+          ),
           noiseScale,
           noiseController,
           defaultTemporalInterpolationSteps,
@@ -208,11 +237,22 @@ export function useStreamState() {
         ) {
           const firstPipelineId = availablePipelines[0] as PipelineId;
           const firstPipelineSchema = schemas.pipelines[firstPipelineId];
+          const defaults = getDefaults(
+            firstPipelineId,
+            firstPipelineSchema.default_mode
+          );
 
           return {
             ...prev,
             pipelineId: firstPipelineId,
             inputMode: firstPipelineSchema.default_mode,
+            denoisingSteps: defaults.denoisingSteps,
+            resolution: {
+              height: defaults.height,
+              width: defaults.width,
+            },
+            noiseScale: defaults.noiseScale,
+            noiseController: defaults.noiseController,
           };
         }
         return prev;
@@ -226,7 +266,7 @@ export function useStreamState() {
       );
       throw error;
     }
-  }, [getPipelineSchemas]);
+  }, [getPipelineSchemas, getDefaults]);
 
   // Function to refresh hardware info (can be called externally)
   const refreshHardwareInfo = useCallback(async () => {
@@ -328,14 +368,22 @@ export function useStreamState() {
         schema?.default_mode &&
         prevPipelineIdRef.current !== settings.pipelineId
       ) {
+        const defaults = getDefaults(settings.pipelineId, schema.default_mode);
         setSettings(prev => ({
           ...prev,
           inputMode: schema.default_mode,
+          denoisingSteps: defaults.denoisingSteps,
+          resolution: {
+            height: defaults.height,
+            width: defaults.width,
+          },
+          noiseScale: defaults.noiseScale,
+          noiseController: defaults.noiseController,
         }));
       }
       prevPipelineIdRef.current = settings.pipelineId;
     }
-  }, [pipelineSchemas, settings.pipelineId]);
+  }, [pipelineSchemas, settings.pipelineId, getDefaults]);
 
   // Set recommended quantization based on pipeline schema and available VRAM
   useEffect(() => {
