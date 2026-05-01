@@ -278,6 +278,8 @@ class LivepeerConnection:
             "error": self._connect_error,
             "webrtc_connected": self.webrtc_connected,
             "app_id": "livepeer" if self.is_connected else None,
+            "backend": "livepeer",
+            "remote_url": None,
             "connection_id": (
                 self._client.connection_id if self._client is not None else None
             ),

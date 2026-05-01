@@ -471,21 +471,83 @@ class SinkManager:
         """Access the recording coordinator for record-node operations."""
         return self._recording
 
-    def setup_cloud_graph(self, graph: Any) -> None:
-        """Set up record queues from a graph config (cloud mode).
+    def setup_cloud_graph(
+        self,
+        graph: Any,
+        dimensions: tuple[int, int] | None = None,
+    ) -> None:
+        """Set up local sink and record queues from a graph config (cloud mode).
 
         In local mode, record queues are wired via setup_graph_queues()
-        from the graph executor. In cloud mode there is no graph executor
-        run, so the sink manager creates the queues directly from the
-        graph config.
+        from the graph executor. In cloud mode there is no local graph
+        executor run, so the sink manager creates the local queues directly
+        from the graph config and remote-output callbacks push frames into
+        them.
         """
+        from .graph_executor import DEFAULT_INPUT_QUEUE_MAXSIZE
         from .graph_schema import GraphConfig
 
         if not isinstance(graph, GraphConfig):
             return
+
+        self._sink_queues_by_node.clear()
+        self._sink_hardware_queues_by_node.clear()
+        self._sink_processors_by_node.clear()
+
+        for node in graph.nodes:
+            if node.type != "sink":
+                continue
+            self._sink_queues_by_node[node.id] = queue.Queue(
+                maxsize=DEFAULT_INPUT_QUEUE_MAXSIZE
+            )
+            if node.sink_mode in ("spout", "ndi", "syphon"):
+                self._sink_hardware_queues_by_node[node.id] = queue.Queue(
+                    maxsize=DEFAULT_INPUT_QUEUE_MAXSIZE
+                )
+
         record_node_ids = graph.get_record_node_ids()
         if record_node_ids:
             self._recording.setup_queues(record_node_ids)
+
+        if dimensions is not None:
+            self.setup_multi_sinks(graph, dimensions)
+
+    def put_to_sink(self, node_id: str, frame) -> None:
+        """Convert a remote VideoFrame to packets for local graph sink queues."""
+        queues = [
+            q
+            for q in (
+                self._sink_queues_by_node.get(node_id),
+                self._sink_hardware_queues_by_node.get(node_id),
+            )
+            if q is not None
+        ]
+        if not queues:
+            return
+        try:
+            frame_np = frame.to_ndarray(format="rgb24")
+            t = torch.as_tensor(frame_np, dtype=torch.uint8).unsqueeze(0)
+            timestamp = MediaTimestamp()
+            if (
+                getattr(frame, "pts", None) is not None
+                and getattr(frame, "time_base", None) is not None
+            ):
+                timestamp = MediaTimestamp(
+                    pts=frame.pts,
+                    time_base=Fraction(frame.time_base),
+                )
+            packet = VideoPacket(tensor=t, timestamp=timestamp)
+            for sink_q in queues:
+                try:
+                    sink_q.put_nowait(packet)
+                except queue.Full:
+                    try:
+                        sink_q.get_nowait()
+                        sink_q.put_nowait(packet)
+                    except queue.Empty:
+                        pass
+        except Exception as e:
+            logger.error(f"Error in put_to_sink for node {node_id}: {e}")
 
     # ------------------------------------------------------------------
     # Lifecycle

@@ -13,16 +13,17 @@ from .graph_schema import GraphConfig
 # Default values for pipeline load params (duplicated from pipeline configs to avoid
 # importing torch-dependent modules). These should match the defaults in:
 # - StreamDiffusionV2Config: height=512, width=512, base_seed=42
-# - LongLiveConfig: height=320, width=576, base_seed=42
+# - LongLiveConfig: height=480, width=832, base_seed=42
 # - KreaRealtimeVideoConfig: height=320, width=576, base_seed=42
 _STREAMDIFFUSIONV2_HEIGHT = 512
 _STREAMDIFFUSIONV2_WIDTH = 512
-_LONGLIVE_HEIGHT = 320
-_LONGLIVE_WIDTH = 576
+_LONGLIVE_HEIGHT = 480
+_LONGLIVE_WIDTH = 832
 _KREA_HEIGHT = 320
 _KREA_WIDTH = 576
 _DEFAULT_SEED = 42
 _DEFAULT_VAE_TYPE = VaeType.WAN
+_LONGLIVE_VAE_TYPE = VaeType.LIGHTTAE
 
 
 class HealthResponse(BaseModel):
@@ -441,7 +442,7 @@ class LongLiveLoadParams(LoRAEnabledLoadParams):
         description="Enable VACE (Video All-In-One Creation and Editing) support for reference image conditioning and structural guidance. When enabled, input video in Video input mode can be used for VACE conditioning. When disabled, video uses faster regular encoding for latent initialization.",
     )
     vae_type: VaeType = Field(
-        default=_DEFAULT_VAE_TYPE,
+        default=_LONGLIVE_VAE_TYPE,
         description="VAE type to use. 'wan' is the full VAE, 'lightvae' is 75% pruned (faster but lower quality), 'tae' is a tiny autoencoder for fast preview quality, 'lighttae' is LightTAE with WanVAE normalization.",
     )
 
@@ -801,6 +802,10 @@ class CloudConnectRequest(BaseModel):
         default=None,
         description="The cloud API key for authentication. Optional if set via CLI.",
     )
+    remote_url: str | None = Field(
+        default=None,
+        description="Remote self-hosted Scope server URL. When provided, Scope uses that server as the compute backend.",
+    )
     user_id: str | None = Field(
         default=None,
         description="The user ID for logging purposes.",
@@ -838,9 +843,17 @@ class CloudConnectionStats(BaseModel):
         default=0,
         description="Number of video frames sent to cloud for processing",
     )
+    frames_sent_to_cloud_fps: float = Field(
+        default=0.0,
+        description="Recent local-to-cloud video frame send rate",
+    )
     frames_received_from_cloud: int = Field(
         default=0,
         description="Number of processed video frames received from cloud",
+    )
+    frames_received_from_cloud_fps: float = Field(
+        default=0.0,
+        description="Recent cloud-to-local processed video frame receive rate",
     )
 
 
@@ -870,6 +883,14 @@ class CloudStatusResponse(BaseModel):
     app_id: str | None = Field(
         default=None,
         description="The cloud app ID if connected",
+    )
+    backend: str | None = Field(
+        default=None,
+        description="Active remote backend type, e.g. 'livepeer' or 'remote_scope'.",
+    )
+    remote_url: str | None = Field(
+        default=None,
+        description="Remote self-hosted Scope server URL when connected through the remote_scope backend.",
     )
     connection_id: str | None = Field(
         default=None,

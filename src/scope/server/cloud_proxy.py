@@ -31,6 +31,79 @@ from .scope_cloud_types import ScopeCloudBackend
 
 logger = logging.getLogger(__name__)
 
+_LONGLIVE_DEFAULT_HEIGHT = 480
+_LONGLIVE_DEFAULT_WIDTH = 832
+_LONGLIVE_DEFAULT_VAE_TYPE = "lighttae"
+_LONGLIVE_ETHEREA_DENOISING = [1000, 875, 750]
+
+
+def _normalize_longlive_pipeline_meta(longlive: Any) -> None:
+    """Patch stale remote LongLive metadata in place."""
+    if not isinstance(longlive, dict):
+        return
+
+    config_schema = longlive.get("config_schema")
+    properties = (
+        config_schema.get("properties")
+        if isinstance(config_schema, dict)
+        else None
+    )
+    if isinstance(properties, dict):
+        height = properties.get("height")
+        if isinstance(height, dict):
+            height["default"] = _LONGLIVE_DEFAULT_HEIGHT
+        width = properties.get("width")
+        if isinstance(width, dict):
+            width["default"] = _LONGLIVE_DEFAULT_WIDTH
+        vae_type = properties.get("vae_type")
+        if isinstance(vae_type, dict):
+            vae_type["default"] = _LONGLIVE_DEFAULT_VAE_TYPE
+        denoising_steps = properties.get("denoising_steps")
+        if isinstance(denoising_steps, dict):
+            denoising_steps["default"] = list(_LONGLIVE_ETHEREA_DENOISING)
+
+    mode_defaults = longlive.get("mode_defaults")
+    if isinstance(mode_defaults, dict):
+        video_defaults = mode_defaults.get("video")
+        if isinstance(video_defaults, dict):
+            video_defaults["height"] = _LONGLIVE_DEFAULT_HEIGHT
+            video_defaults["width"] = _LONGLIVE_DEFAULT_WIDTH
+            video_defaults["denoising_steps"] = list(_LONGLIVE_ETHEREA_DENOISING)
+
+
+def _normalize_legacy_longlive_schema(response: Any) -> Any:
+    """Patch stale remote LongLive defaults before the frontend consumes them."""
+    if not isinstance(response, dict):
+        return response
+    pipelines = response.get("pipelines")
+    if not isinstance(pipelines, dict):
+        return response
+    _normalize_longlive_pipeline_meta(pipelines.get("longlive"))
+
+    return response
+
+
+def _normalize_legacy_longlive_node_definitions(response: Any) -> Any:
+    if not isinstance(response, dict):
+        return response
+    nodes = response.get("nodes")
+    if not isinstance(nodes, list):
+        return response
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        if node.get("node_type_id") == "longlive":
+            _normalize_longlive_pipeline_meta(node.get("pipeline_meta"))
+    return response
+
+
+def _normalize_proxied_response(path: str, response: Any) -> Any:
+    if path == "/api/v1/pipelines/schemas":
+        return _normalize_legacy_longlive_schema(response)
+    if path == "/api/v1/nodes/definitions":
+        return _normalize_legacy_longlive_node_definitions(response)
+    return response
+
 
 async def _proxy_to_cloud(
     cloud_manager: ScopeCloudBackend,
@@ -315,6 +388,7 @@ def cloud_proxy(
     path: str | PathResolver | None = None,
     *,
     timeout: float = 30.0,
+    required_keys: tuple[str, ...] | None = None,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Decorator: when cloud is connected, proxy the request to cloud; else run the handler.
 
@@ -331,6 +405,10 @@ def cloud_proxy(
               dynamic paths (e.g. recording download). Query string is always
               appended from the incoming request.
         timeout: Timeout in seconds for the cloud request (default 30.0).
+        required_keys: Optional top-level response keys required for proxy use.
+                       If missing, run the local handler instead. This keeps
+                       newer desktop metadata endpoints compatible with older
+                       remote Scope pods that return the frontend HTML shell.
     """
 
     def decorator(f: Callable[..., Any]) -> Callable[..., Any]:
@@ -362,7 +440,7 @@ def cloud_proxy(
             else:
                 actual_path = path
             actual_method = http_request.method.upper()
-            return await _proxy_to_cloud(
+            proxied_response = await _proxy_to_cloud(
                 cloud_manager,
                 http_request,
                 actual_path,
@@ -370,6 +448,22 @@ def cloud_proxy(
                 timeout,
                 CLOUD_REQUEST_FAILED,
             )
+            proxied_response = _normalize_proxied_response(
+                actual_path,
+                proxied_response,
+            )
+            if required_keys and (
+                not isinstance(proxied_response, dict)
+                or any(key not in proxied_response for key in required_keys)
+            ):
+                logger.warning(
+                    "cloud_proxy: response for %s missing required keys %s; "
+                    "running local handler",
+                    actual_path,
+                    required_keys,
+                )
+                return await f(*args, **kwargs)
+            return proxied_response
 
         return wrapper
 

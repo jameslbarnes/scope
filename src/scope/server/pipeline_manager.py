@@ -748,6 +748,7 @@ class PipelineManager:
         default_height: int,
         default_width: int,
         default_seed: int = 42,
+        default_vae_type: str = "wan",
     ) -> None:
         """Extract and apply common load parameters
 
@@ -757,13 +758,14 @@ class PipelineManager:
             default_height: Default height if not in load_params
             default_width: Default width if not in load_params
             default_seed: Default base_seed if not in load_params
+            default_vae_type: Default VAE type if not in load_params
         """
         height = default_height
         width = default_width
         base_seed = default_seed
         loras = None
         lora_merge_mode = "permanent_merge"
-        vae_type = "wan"  # Default VAE type
+        vae_type = default_vae_type
 
         if load_params:
             height = load_params.get("height", default_height)
@@ -1058,9 +1060,10 @@ class PipelineManager:
             self._apply_load_params(
                 config,
                 load_params,
-                default_height=320,
-                default_width=576,
+                default_height=480,
+                default_width=832,
                 default_seed=42,
+                default_vae_type="lighttae",
             )
 
             quantization = None

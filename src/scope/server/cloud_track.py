@@ -172,6 +172,40 @@ class CloudTrack(MediaStreamTrack):
                 )
             self._pending_extra_sources.clear()
 
+            if self.frame_processor is not None:
+                output_handlers = getattr(webrtc_client, "output_handlers", [])
+                for sink_index, sink_node_id in enumerate(
+                    self.frame_processor.get_sink_node_ids()
+                ):
+                    if sink_index >= len(output_handlers):
+                        logger.warning(
+                            "Could not wire local sink node %s to cloud output "
+                            "index %d (have %d output handler(s))",
+                            sink_node_id,
+                            sink_index,
+                            len(output_handlers),
+                        )
+                        continue
+
+                    def _make_sink_callback(node_id: str) -> Callable:
+                        def _cb(frame: VideoFrame) -> None:
+                            if self.frame_processor is not None:
+                                self.frame_processor.sink_manager.put_to_sink(
+                                    node_id,
+                                    frame,
+                                )
+
+                        return _cb
+
+                    output_handlers[sink_index].add_callback(
+                        _make_sink_callback(sink_node_id)
+                    )
+                    logger.info(
+                        "Wired local sink node %s to cloud output %d",
+                        sink_node_id,
+                        sink_index,
+                    )
+
             # Wire extra sink output callbacks (index 0 is primary, 1+ are extras)
             for i, sink_track in enumerate(self._extra_sink_tracks):
                 sink_index = i + 1

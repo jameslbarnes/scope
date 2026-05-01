@@ -333,6 +333,10 @@ pipeline_manager = None
 server_start_time = time.time()
 # Global Livepeer manager instance
 livepeer = None
+# Global self-hosted remote Scope manager instance
+remote_scope = None
+# Currently selected remote backend
+scope_cloud = None
 # Global Kafka publisher instance (optional, initialized if credentials are present)
 kafka_publisher = None
 # Global tempo sync manager instance
@@ -375,6 +379,7 @@ async def lifespan(app: FastAPI):
 
     from .livepeer import LivepeerConnection
     from .pipeline_manager import PipelineManager
+    from .remote_scope import RemoteScopeConnection
     from .tempo_sync import TempoSync
     from .webrtc import WebRTCManager
 
@@ -384,6 +389,8 @@ async def lifespan(app: FastAPI):
         pipeline_manager, \
         kafka_publisher, \
         livepeer, \
+        remote_scope, \
+        scope_cloud, \
         tempo_sync, \
         osc_server, \
         dmx_server
@@ -434,6 +441,10 @@ async def lifespan(app: FastAPI):
     livepeer = LivepeerConnection()
     livepeer.configure()
     logger.info("Livepeer configured")
+
+    remote_scope = RemoteScopeConnection()
+    scope_cloud = livepeer
+    logger.info("Remote Scope backend configured")
 
     # Initialize Kafka publisher if credentials are configured
     if is_kafka_enabled():
@@ -518,6 +529,11 @@ async def lifespan(app: FastAPI):
         await livepeer.disconnect()
         logger.info("Livepeer connection shutdown complete")
 
+    if remote_scope and remote_scope.is_connected:
+        logger.info("Shutting down Remote Scope connection...")
+        await remote_scope.disconnect()
+        logger.info("Remote Scope connection shutdown complete")
+
     if kafka_publisher:
         logger.info("Shutting down Kafka publisher...")
         await kafka_publisher.stop()
@@ -553,7 +569,7 @@ def get_scope_cloud() -> ScopeCloudBackend:
     inspect status, including connecting/error states.  Callers that need an
     *active* connection must check cloud_manager.is_connected themselves.
     """
-    return livepeer
+    return scope_cloud or livepeer
 
 
 def get_dmx_server():
@@ -780,7 +796,7 @@ async def get_pipeline_status(
 
 
 @app.get("/api/v1/pipelines/schemas", response_model=PipelineSchemasResponse)
-@cloud_proxy()
+@cloud_proxy(required_keys=("pipelines",))
 async def get_pipeline_schemas(
     http_request: Request,
     cloud_manager: ScopeCloudBackend = Depends(get_scope_cloud),
@@ -835,7 +851,7 @@ async def get_pipeline_schemas(
 
 
 @app.get("/api/v1/nodes/definitions", response_model=NodeDefinitionsResponse)
-@cloud_proxy()
+@cloud_proxy(required_keys=("nodes",))
 async def get_node_definitions(
     http_request: Request,
     cloud_manager: ScopeCloudBackend = Depends(get_scope_cloud),
@@ -1605,7 +1621,7 @@ class LoRAFilesResponse(BaseModel):
 
 
 @app.get("/api/v1/loras", response_model=LoRAFilesResponse)
-@cloud_proxy()
+@cloud_proxy(required_keys=("lora_files",))
 async def list_lora_files(
     http_request: Request,
     cloud_manager: ScopeCloudBackend = Depends(get_scope_cloud),
@@ -2106,7 +2122,7 @@ async def resolve_workflow_endpoint(
 
 
 @app.get("/api/v1/assets", response_model=AssetsResponse)
-@cloud_proxy()
+@cloud_proxy(required_keys=("assets",))
 async def list_assets(
     http_request: Request,
     type: str | None = Query(None, description="Filter by asset type (image, video)"),
@@ -3381,20 +3397,62 @@ async def connect_to_cloud(
         Spout → Backend → cloud (WebRTC) → Backend → Spout/Browser
     """
     try:
+        global scope_cloud
         # Use request body credentials if provided, otherwise fall back to CLI/env
+        remote_url = request.remote_url or os.environ.get("SCOPE_REMOTE_SCOPE_URL")
         app_id = request.app_id or os.environ.get("SCOPE_CLOUD_APP_ID")
         api_key = request.api_key or os.environ.get("SCOPE_CLOUD_API_KEY")
+        if remote_url:
+            if remote_scope is None:
+                raise RuntimeError("Remote Scope backend is not initialized")
+            if cloud_manager is not remote_scope and getattr(
+                cloud_manager, "is_connected", False
+            ):
+                await cloud_manager.disconnect()
+            scope_cloud = remote_scope
+            remote_api_key = request.api_key or os.environ.get(
+                "SCOPE_REMOTE_SCOPE_API_KEY"
+            )
+            logger.info(
+                f"Connecting to remote Scope backend (background): {remote_url}"
+            )
+            await remote_scope.connect_background(
+                remote_url=remote_url,
+                api_key=remote_api_key,
+                user_id=request.user_id,
+            )
+
+            _invalidate_plugin_caches()
+
+            return CloudStatusResponse(
+                connected=False,
+                connecting=True,
+                webrtc_connected=False,
+                app_id="remote-scope",
+                backend="remote_scope",
+                remote_url=remote_url,
+                credentials_configured=bool(os.environ.get("SCOPE_REMOTE_SCOPE_URL")),
+            )
+
         if not app_id and not api_key:
             raise HTTPException(
                 status_code=400,
                 detail="cloud credentials not configured. Use --cloud-app-id or --cloud-api-key CLI args, "
-                "or SCOPE_CLOUD_APP_ID or SCOPE_CLOUD_API_KEY environment variables.",
+                "SCOPE_CLOUD_APP_ID/SCOPE_CLOUD_API_KEY environment variables, "
+                "or provide remote_url for a self-hosted Scope server.",
             )
+        if livepeer is None:
+            raise RuntimeError("Livepeer backend is not initialized")
+        if cloud_manager is not livepeer and getattr(
+            cloud_manager, "is_connected", False
+        ):
+            await cloud_manager.disconnect()
+        scope_cloud = livepeer
 
         logger.info(
             f"Connecting to cloud (background): {app_id} (user_id: {request.user_id})"
         )
-        await cloud_manager.connect_background(app_id, api_key, request.user_id)
+        await livepeer.connect_background(app_id, api_key, request.user_id)
 
         # Invalidate cached pipeline schemas so that when the cloud connection
         # completes, subsequent requests either proxy to the cloud (returning
@@ -3408,6 +3466,7 @@ async def connect_to_cloud(
             connecting=True,
             webrtc_connected=False,
             app_id=app_id,
+            backend="livepeer",
             credentials_configured=credentials_configured,
         )
     except Exception as e:
@@ -3425,16 +3484,23 @@ async def disconnect_from_cloud(
     to local GPU processing mode. Any in-progress operations will be interrupted.
     """
     try:
+        global scope_cloud
         await cloud_manager.disconnect()
+        scope_cloud = livepeer
         # Invalidate cached pipeline schemas so that post-disconnect requests
         # rebuild the list from the local registry instead of returning stale
         # cloud-era data.
         _invalidate_plugin_caches()
-        credentials_configured = bool(os.environ.get("SCOPE_CLOUD_APP_ID"))
+        credentials_configured = bool(
+            os.environ.get("SCOPE_CLOUD_APP_ID")
+            or os.environ.get("SCOPE_REMOTE_SCOPE_URL")
+        )
         return CloudStatusResponse(
             connected=False,
             webrtc_connected=False,
             app_id=None,
+            backend=None,
+            remote_url=None,
             credentials_configured=credentials_configured,
         )
     except Exception as e:
@@ -3449,7 +3515,9 @@ async def get_cloud_status(
     """Get current cloud connection status."""
     status = cloud_manager.get_status()
     # Check if credentials are configured via CLI/env
-    credentials_configured = bool(os.environ.get("SCOPE_CLOUD_APP_ID"))
+    credentials_configured = bool(
+        os.environ.get("SCOPE_CLOUD_APP_ID") or os.environ.get("SCOPE_REMOTE_SCOPE_URL")
+    )
     return CloudStatusResponse(**status, credentials_configured=credentials_configured)
 
 
@@ -3684,6 +3752,12 @@ def run_server(reload: bool, host: str, port: int, no_browser: bool):
     help="Cloud API key for cloud mode",
 )
 @click.option(
+    "--remote-scope-url",
+    default=None,
+    envvar="SCOPE_REMOTE_SCOPE_URL",
+    help="Self-hosted remote Scope server URL to use as the compute backend",
+)
+@click.option(
     "--mcp",
     is_flag=True,
     help="Run as an MCP (Model Context Protocol) server over stdio instead of the HTTP server. "
@@ -3699,6 +3773,7 @@ def main(
     no_browser: bool,
     cloud_app_id: str | None,
     cloud_api_key: str | None,
+    remote_scope_url: str | None,
     mcp: bool,
 ):
     # Handle version flag
@@ -3725,6 +3800,8 @@ def main(
         os.environ["SCOPE_CLOUD_APP_ID"] = cloud_app_id
     if cloud_api_key:
         os.environ["SCOPE_CLOUD_API_KEY"] = cloud_api_key
+    if remote_scope_url:
+        os.environ["SCOPE_REMOTE_SCOPE_URL"] = remote_scope_url
 
     # If no subcommand was invoked, run the server
     if ctx.invoked_subcommand is None:

@@ -274,7 +274,7 @@ def create_mcp_server(base_url: str | None = None) -> FastMCP:
         Generation:
         - noise_scale: float 0.0-1.0 (video mode only, controls noise injection)
         - noise_controller: bool, automatic noise scale adjustment based on motion detection
-        - denoising_step_list: list of ints, e.g. [1000, 750, 500, 250]
+        - denoising_step_list: list of ints, e.g. [1000, 750, 500]
 
         Cache:
         - manage_cache: bool, automatic cache management on parameter changes

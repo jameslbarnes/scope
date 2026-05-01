@@ -224,7 +224,10 @@ class FrameProcessor:
 
                 graph = GraphConfig(**graph_data)
                 self._source_manager.setup_multi_sources(graph)
-                self.sink_manager.setup_cloud_graph(graph)
+                self.sink_manager.setup_cloud_graph(
+                    graph,
+                    self._get_pipeline_dimensions(),
+                )
 
             logger.info("[FRAME-PROCESSOR] Started in cloud mode")
 
@@ -852,6 +855,11 @@ class FrameProcessor:
 
     def _get_pipeline_dimensions(self) -> tuple[int, int]:
         """Get current pipeline dimensions from pipeline manager."""
+        if self.pipeline_manager is None:
+            load_params = self.parameters.get("load_params") or {}
+            width = self.parameters.get("width") or load_params.get("width", 512)
+            height = self.parameters.get("height") or load_params.get("height", 512)
+            return int(width), int(height)
         try:
             status_info = self.pipeline_manager.get_status_info()
             load_params = status_info.get("load_params") or {}
