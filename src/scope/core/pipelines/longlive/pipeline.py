@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_DENOISING_STEP_LIST = [1000, 750, 500, 250]
+DEFAULT_DENOISING_STEP_LIST = [1000, 875, 750]
 
 
 class LongLivePipeline(Pipeline, LoRAEnabledPipeline, VACEEnabledPipeline):

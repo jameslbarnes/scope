@@ -96,11 +96,14 @@ def apply_mode_defaults_to_state(
         kwargs: Optional kwargs dict to check if parameter was explicitly provided
     """
     kwargs = kwargs or {}
-    config = get_pipeline_config(pipeline_class)
+    config_class = pipeline_class.get_config_class()
+    config = config_class()
+    mode_defaults = config_class.get_defaults_for_mode(mode or INPUT_MODE_TEXT)
 
     # Apply denoising steps if not explicitly provided
-    if "denoising_step_list" not in kwargs and config.denoising_steps:
-        state.set("denoising_step_list", config.denoising_steps)
+    denoising_steps = mode_defaults.get("denoising_steps", config.denoising_steps)
+    if "denoising_step_list" not in kwargs and denoising_steps:
+        state.set("denoising_step_list", denoising_steps)
 
     # For text mode, noise controls should be None unless the modulation
     # engine explicitly injected a noise_scale value into kwargs.
@@ -113,10 +116,14 @@ def apply_mode_defaults_to_state(
             state.set("noise_controller", None)
     else:
         # For video mode, apply defaults if not provided
-        if "noise_scale" not in kwargs and config.noise_scale is not None:
-            state.set("noise_scale", config.noise_scale)
-        if "noise_controller" not in kwargs and config.noise_controller is not None:
-            state.set("noise_controller", config.noise_controller)
+        noise_scale = mode_defaults.get("noise_scale", config.noise_scale)
+        noise_controller = mode_defaults.get(
+            "noise_controller", config.noise_controller
+        )
+        if "noise_scale" not in kwargs and noise_scale is not None:
+            state.set("noise_scale", noise_scale)
+        if "noise_controller" not in kwargs and noise_controller is not None:
+            state.set("noise_controller", noise_controller)
 
 
 # -----------------------------------------------------------------------------

@@ -65,12 +65,12 @@ class LongLiveConfig(BasePipelineConfig):
         ),
     )
     vae_type: VaeType = Field(
-        default=VaeType.WAN,
+        default=VaeType.LIGHTTAE,
         description="VAE type to use. 'wan' is the full VAE, 'lightvae' is 75% pruned (faster but lower quality).",
         json_schema_extra=ui_field_config(order=3, is_load_param=True, label="VAE"),
     )
     height: int = Field(
-        default=320,
+        default=480,
         ge=1,
         description="Output height in pixels",
         json_schema_extra=ui_field_config(
@@ -78,7 +78,7 @@ class LongLiveConfig(BasePipelineConfig):
         ),
     )
     width: int = Field(
-        default=576,
+        default=832,
         ge=1,
         description="Output width in pixels",
         json_schema_extra=ui_field_config(
@@ -99,7 +99,7 @@ class LongLiveConfig(BasePipelineConfig):
         ),
     )
     denoising_steps: list[int] = Field(
-        default=[1000, 750, 500, 250],
+        default=[1000, 875, 750],
         description="Denoising step schedule for progressive generation",
         json_schema_extra=ui_field_config(
             order=6,
@@ -143,10 +143,10 @@ class LongLiveConfig(BasePipelineConfig):
     modes = {
         "text": ModeDefaults(default=True),
         "video": ModeDefaults(
-            height=512,
-            width=512,
+            height=480,
+            width=832,
             noise_scale=0.7,
             noise_controller=True,
-            denoising_steps=[1000, 750],
+            denoising_steps=[1000, 875, 750],
         ),
     }
