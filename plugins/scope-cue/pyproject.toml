@@ -1,0 +1,16 @@
+[project]
+name = "scope-cue"
+version = "0.1.0"
+description = "Cue integration nodes for Daydream Scope"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.entry-points."scope"]
+scope-cue = "scope_cue_plugin.plugin"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/scope_cue_plugin"]
