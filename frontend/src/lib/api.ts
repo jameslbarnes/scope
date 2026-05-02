@@ -321,6 +321,72 @@ export interface InputSourceResolution {
   height: number;
 }
 
+export interface CueSessionStateOptions {
+  baseUrl: string;
+  sessionId: string;
+  timeoutMs?: number;
+}
+
+export interface CueObservationProxyOptions extends CueSessionStateOptions {
+  observation: Record<string, unknown>;
+}
+
+export const getCueSessionState = async ({
+  baseUrl,
+  sessionId,
+  timeoutMs = 1000,
+}: CueSessionStateOptions): Promise<Record<string, unknown>> => {
+  const params = new URLSearchParams({
+    base_url: baseUrl,
+    timeout_ms: String(timeoutMs),
+  });
+  const response = await fetch(
+    `/api/v1/cue/sessions/${encodeURIComponent(sessionId)}/state?${params.toString()}`,
+    {
+      method: "GET",
+      headers: { "Content-Type": "application/json" },
+    }
+  );
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(
+      `Cue state failed: ${response.status} ${response.statusText}: ${errorText}`
+    );
+  }
+
+  return response.json();
+};
+
+export const postCueObservation = async ({
+  baseUrl,
+  sessionId,
+  timeoutMs = 1000,
+  observation,
+}: CueObservationProxyOptions): Promise<Record<string, unknown>> => {
+  const response = await fetch(
+    `/api/v1/cue/sessions/${encodeURIComponent(sessionId)}/observations`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        base_url: baseUrl,
+        timeout_ms: timeoutMs,
+        observation,
+      }),
+    }
+  );
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(
+      `Cue observation failed: ${response.status} ${response.statusText}: ${errorText}`
+    );
+  }
+
+  return response.json();
+};
+
 export const getInputSourceResolution = async (
   sourceType: string,
   identifier: string,

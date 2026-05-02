@@ -17,8 +17,10 @@ from importlib.metadata import version
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import quote, urlparse
 
 import click
+import httpx
 import uvicorn
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -598,6 +600,101 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+CUE_DEFAULT_BASE_URL = "http://127.0.0.1:8792"
+
+
+class CueObservationProxyRequest(BaseModel):
+    base_url: str = Field(default=CUE_DEFAULT_BASE_URL)
+    timeout_ms: int = Field(default=1000, ge=50, le=30000)
+    observation: dict[str, Any] | None = None
+    observations: list[dict[str, Any]] | None = None
+
+
+def _normalize_cue_base_url(base_url: str) -> str:
+    parsed = urlparse(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise HTTPException(status_code=400, detail="Cue base_url must be http(s).")
+    return base_url.rstrip("/")
+
+
+def _cue_session_url(base_url: str, session_id: str, route: str) -> str:
+    base = _normalize_cue_base_url(base_url)
+    return f"{base}/sessions/{quote(session_id, safe='')}/{route}"
+
+
+def _cue_timeout(timeout_ms: int) -> httpx.Timeout:
+    seconds = max(timeout_ms, 50) / 1000
+    return httpx.Timeout(seconds, connect=min(seconds, 5.0))
+
+
+async def _raise_cue_proxy_error(exc: Exception) -> None:
+    if isinstance(exc, httpx.HTTPStatusError):
+        detail = exc.response.text or exc.response.reason_phrase
+        raise HTTPException(status_code=exc.response.status_code, detail=detail) from exc
+    if isinstance(exc, httpx.RequestError):
+        raise HTTPException(status_code=502, detail=f"Cue request failed: {exc}") from exc
+    raise exc
+
+
+@app.get("/api/v1/cue/sessions/{session_id}/state")
+async def cue_session_state(
+    session_id: str,
+    base_url: str = Query(default=CUE_DEFAULT_BASE_URL),
+    timeout_ms: int = Query(default=1000, ge=50, le=30000),
+):
+    """Proxy Cue session state so the desktop UI can avoid browser CORS issues."""
+    try:
+        async with httpx.AsyncClient(timeout=_cue_timeout(timeout_ms)) as client:
+            response = await client.get(_cue_session_url(base_url, session_id, "state"))
+            response.raise_for_status()
+            return response.json()
+    except Exception as exc:
+        await _raise_cue_proxy_error(exc)
+
+
+@app.get("/api/v1/cue/sessions/{session_id}/agent")
+async def cue_session_agent(
+    session_id: str,
+    base_url: str = Query(default=CUE_DEFAULT_BASE_URL),
+    timeout_ms: int = Query(default=1000, ge=50, le=30000),
+):
+    """Proxy Cue's machine-readable session manifest for node UI discovery."""
+    try:
+        async with httpx.AsyncClient(timeout=_cue_timeout(timeout_ms)) as client:
+            response = await client.get(_cue_session_url(base_url, session_id, "agent"))
+            response.raise_for_status()
+            return response.json()
+    except Exception as exc:
+        await _raise_cue_proxy_error(exc)
+
+
+@app.post("/api/v1/cue/sessions/{session_id}/observations")
+async def cue_session_observations(
+    session_id: str,
+    request: CueObservationProxyRequest,
+):
+    """Proxy manual chat and mapped graph observations into Cue."""
+    payload: dict[str, Any]
+    if request.observations is not None:
+        payload = {"observations": request.observations}
+    elif request.observation is not None:
+        payload = request.observation
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide observation or observations.",
+        )
+    try:
+        async with httpx.AsyncClient(timeout=_cue_timeout(request.timeout_ms)) as client:
+            response = await client.post(
+                _cue_session_url(request.base_url, session_id, "observations"),
+                json=payload,
+            )
+            response.raise_for_status()
+            return response.json()
+    except Exception as exc:
+        await _raise_cue_proxy_error(exc)
 
 
 @app.get("/health", response_model=HealthResponse)

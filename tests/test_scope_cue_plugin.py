@@ -12,6 +12,7 @@ from scope_cue_plugin.nodes.cue_session import CueSessionNode  # noqa: E402
 
 
 class _CueStateHandler(BaseHTTPRequestHandler):
+    observations = []
     state = {
         "state": {
             "transcript": "The room turns blue.",
@@ -48,11 +49,30 @@ class _CueStateHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_POST(self):
+        if self.path != "/sessions/demo/observations":
+            self.send_response(404)
+            self.end_headers()
+            return
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length).decode("utf-8")
+        decoded = json.loads(body) if body else {}
+        type(self).observations.append(decoded)
+        response_body = json.dumps({"sessionId": "demo", "results": []}).encode(
+            "utf-8"
+        )
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(response_body)))
+        self.end_headers()
+        self.wfile.write(response_body)
+
     def log_message(self, format, *args):
         return
 
 
 def _serve_cue_state():
+    _CueStateHandler.observations = []
     server = ThreadingHTTPServer(("127.0.0.1", 0), _CueStateHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -71,6 +91,21 @@ def test_cue_session_node_definition_exposes_expected_ports():
         "transcript",
         "status",
         "tick",
+        "chat_status",
+        "mapping_json",
+    }
+    assert {port.name for port in definition.inputs} >= {
+        "refresh",
+        "chat_in",
+        "context_json",
+    }
+    assert {param.name for param in definition.params} >= {
+        "cue_file_path",
+        "cue_file_json",
+        "input_mapping_json",
+        "output_mapping_json",
+        "chat_text",
+        "chat_submit_count",
     }
 
 
@@ -92,6 +127,8 @@ def test_cue_session_node_polls_state_and_emits_prompt_action():
         assert outputs["observation_count"] == 8
         assert outputs["status"] == "ok"
         assert outputs["tick"] == 1
+        mapping = json.loads(outputs["mapping_json"])
+        assert mapping["outputs"]["prompt"] == "longlive.prompt"
         assert json.loads(outputs["action_json"])["type"] == "video.update_prompt"
     finally:
         server.shutdown()
@@ -139,3 +176,53 @@ def test_cue_session_node_reports_connection_errors_once():
     assert outputs["status"].startswith("error:")
     assert outputs["tick"] == 1
     assert repeat == {}
+
+
+def test_cue_session_node_posts_chat_submissions_once():
+    server = _serve_cue_state()
+    try:
+        node = CueSessionNode("cue")
+        kwargs = {
+            "cue_base_url": f"http://127.0.0.1:{server.server_port}",
+            "session_id": "demo",
+            "poll_interval_ms": 0,
+            "chat_text": "Make the room brighter.",
+            "chat_submit_count": 1,
+        }
+
+        outputs = node.execute({}, **kwargs)
+        node.execute({}, **kwargs)
+
+        assert outputs["chat_status"] == "chat sent"
+        assert len(_CueStateHandler.observations) == 1
+        observation = _CueStateHandler.observations[0]
+        assert observation["type"] == "transcript.segment"
+        assert observation["source"] == "scope.chat"
+        assert observation["payload"]["text"] == "Make the room brighter."
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_cue_session_node_forwards_mapped_inputs():
+    server = _serve_cue_state()
+    try:
+        node = CueSessionNode("cue")
+        kwargs = {
+            "cue_base_url": f"http://127.0.0.1:{server.server_port}",
+            "session_id": "demo",
+            "poll_interval_ms": 0,
+        }
+
+        outputs = node.execute({"chat_in": "Use the blue wall."}, **kwargs)
+        node.execute({"chat_in": "Use the blue wall."}, **kwargs)
+
+        assert outputs["chat_status"] == "chat_in sent"
+        assert len(_CueStateHandler.observations) == 1
+        observation = _CueStateHandler.observations[0]
+        assert observation["type"] == "transcript.segment"
+        assert observation["source"] == "scope.input.chat_in"
+        assert observation["payload"]["text"] == "Use the blue wall."
+    finally:
+        server.shutdown()
+        server.server_close()

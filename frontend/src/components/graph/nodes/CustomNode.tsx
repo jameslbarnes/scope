@@ -24,6 +24,7 @@ import {
   NodePillToggle,
   collapsedHandleStyle,
 } from "../ui";
+import { CueSessionWidget } from "./CueSessionWidget";
 
 const PARAM_PUSH_DEBOUNCE_MS = 100;
 
@@ -108,6 +109,10 @@ export function CustomNode({ id, data, selected }: NodeProps<CustomNodeType>) {
   const inputs = data.customNodeInputs ?? [];
   const outputs = data.customNodeOutputs ?? [];
   const params = data.customNodeParamDefs ?? [];
+  const isCueSession = data.customNodeTypeId === "cue.session";
+  const visibleParams = isCueSession
+    ? params.filter(p => p.ui?.widget !== "cue_hidden")
+    : params;
 
   // ComfyUI-style widget→input linkage: an input port whose name matches
   // a param renders on the same row as the param, and the wire's
@@ -166,7 +171,7 @@ export function CustomNode({ id, data, selected }: NodeProps<CustomNodeType>) {
     collapsed,
     unlinkedInputs.map(p => p.name).join("|"),
     outputs.map(p => p.name).join("|"),
-    params.map(p => p.name).join("|"),
+    visibleParams.map(p => p.name).join("|"),
   ]);
 
   return (
@@ -174,6 +179,7 @@ export function CustomNode({ id, data, selected }: NodeProps<CustomNodeType>) {
       selected={selected}
       collapsed={collapsed}
       autoMinHeight={!collapsed}
+      minWidth={isCueSession ? 380 : 240}
     >
       <NodeHeader
         title={displayName}
@@ -183,6 +189,15 @@ export function CustomNode({ id, data, selected }: NodeProps<CustomNodeType>) {
       />
       {!collapsed && (
         <NodeBody withGap>
+          {isCueSession && (
+            <CueSessionWidget
+              data={data}
+              params={params}
+              outputs={outputs}
+              setParam={setParam}
+            />
+          )}
+
           {unlinkedInputs.map(p => (
             <div key={`in-${p.name}`} ref={setRowRef(`in:${p.name}`)}>
               <NodeParamRow label={p.name}>
@@ -199,7 +214,7 @@ export function CustomNode({ id, data, selected }: NodeProps<CustomNodeType>) {
             </div>
           ))}
 
-          {params.map(p => {
+          {visibleParams.map(p => {
             const connected = upstreamByPort.has(p.name);
             const val = connected
               ? (upstreamByPort.get(p.name) ?? "")
