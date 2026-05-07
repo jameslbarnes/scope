@@ -39,6 +39,17 @@ export type { EnrichNodesDeps };
 
 const LS_GRAPH_KEY = "scope:graph:backup";
 
+function needsCustomNodeDefinition(node: Node<FlowNodeData>): boolean {
+  if (node.data.nodeType !== "custom_node" || !node.data.customNodeTypeId) {
+    return false;
+  }
+  if (!node.data.customNodeInputs || !node.data.customNodeOutputs) return true;
+  return (
+    node.data.customNodeInputs.length === 0 &&
+    node.data.customNodeOutputs.length === 0
+  ) || !node.data.customNodeParamDefs;
+}
+
 function saveGraphToLocalStorage(graphJson: string): void {
   try {
     localStorage.setItem(LS_GRAPH_KEY, graphJson);
@@ -81,9 +92,7 @@ function hydrateCustomNodeDefinitions(
   signal: AbortSignal,
   onDefinitionsLoaded?: (defMap: Map<string, NodeDefinitionDto>) => void
 ): void {
-  const customFlowNodes = nodes.filter(
-    n => n.data.nodeType === "custom_node" && !n.data.customNodeInputs
-  );
+  const customFlowNodes = nodes.filter(needsCustomNodeDefinition);
   if (customFlowNodes.length === 0) return;
   fetchNodeDefinitions({ signal })
     .then(data => {
@@ -97,12 +106,13 @@ function hydrateCustomNodeDefinitions(
         return prev.map(n => {
           if (
             n.data.nodeType !== "custom_node" ||
-            !n.data.customNodeTypeId ||
-            n.data.customNodeInputs
+            !needsCustomNodeDefinition(n)
           ) {
             return n;
           }
-          const def = defMap.get(n.data.customNodeTypeId);
+          const customNodeTypeId = n.data.customNodeTypeId;
+          if (!customNodeTypeId) return n;
+          const def = defMap.get(customNodeTypeId);
           if (!def) return n;
           return {
             ...n,

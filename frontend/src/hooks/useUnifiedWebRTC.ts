@@ -156,7 +156,15 @@ export function useUnifiedWebRTC(options?: UseUnifiedWebRTCOptions) {
       sinkNodeIds?: string[],
       sourceNodeStreams?: Record<string, MediaStream>
     ) => {
-      if (isConnecting || peerConnectionRef.current) return;
+      if (isConnecting) return;
+
+      if (peerConnectionRef.current) {
+        const staleState = peerConnectionRef.current.connectionState;
+        console.warn(
+          `[UnifiedWebRTC] Resetting stale peer connection before start (state=${staleState})`
+        );
+        resetConnectionState();
+      }
 
       setIsConnecting(true);
 
@@ -300,7 +308,7 @@ export function useUnifiedWebRTC(options?: UseUnifiedWebRTCOptions) {
           console.log(
             "[UnifiedWebRTC] No video stream - adding transceiver for no-input pipeline"
           );
-          transceiver = pc.addTransceiver("video");
+          transceiver = pc.addTransceiver("video", { direction: "recvonly" });
         }
 
         // Add a receive-only audio transceiver so the SDP offer includes an

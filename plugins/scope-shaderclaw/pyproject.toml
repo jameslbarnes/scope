@@ -1,0 +1,20 @@
+[project]
+name = "scope-shaderclaw"
+version = "0.1.0"
+description = "ShaderClaw3 video source pipeline for Daydream Scope"
+requires-python = ">=3.12"
+dependencies = [
+    "glcontext>=3.0",
+    "moderngl>=5.12",
+    "pillow>=10.0",
+]
+
+[project.entry-points."scope"]
+scope-shaderclaw = "scope_shaderclaw_plugin.plugin"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/scope_shaderclaw_plugin"]

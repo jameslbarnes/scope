@@ -4,9 +4,63 @@ import os
 import torch
 
 SAGEATTN_AVAILABLE = False
+
+
+def _get_cuda_arch():
+    if torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(0)
+        return props.major * 10 + props.minor
+    return 0
+
+
+def _build_flashattention2_sageattn():
+    from flash_attn import flash_attn_func
+
+    def flashattention2_sageattn(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
+        dropout_p: float = 0,
+        is_causal: bool = False,
+    ) -> torch.Tensor:
+        if attn_mask is not None or q.device.type != "cuda":
+            return torch.nn.functional.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+                is_causal=is_causal,
+            )
+
+        original_dtype = q.dtype
+        half_dtypes = (torch.float16, torch.bfloat16)
+        compute_dtype = q.dtype if q.dtype in half_dtypes else torch.bfloat16
+
+        q_fa = q.transpose(1, 2).contiguous().to(compute_dtype)
+        k_fa = k.transpose(1, 2).contiguous().to(compute_dtype)
+        v_fa = v.transpose(1, 2).contiguous().to(compute_dtype)
+
+        out = flash_attn_func(
+            q_fa,
+            k_fa,
+            v_fa,
+            dropout_p=dropout_p,
+            causal=is_causal,
+        )
+        return out.transpose(1, 2).contiguous().to(original_dtype)
+
+    return flashattention2_sageattn
+
+
 try:
     if os.getenv("DISABLE_SAGEATTENTION", "0") != "0":
         raise Exception("DISABLE_SAGEATTENTION is set")
+    if _get_cuda_arch() >= 100:
+        raise RuntimeError(
+            "SageAttention is not supported on Blackwell sm100+; using FlashAttention2 fallback"
+        )
 
     from sageattention import sageattn
 
@@ -75,4 +129,10 @@ except Exception as e:
         print("sageattention DLL loading error")
     elif "kernel probe failed" in str(e) or "health check failed" in str(e):
         print("sageattention kernels are not compatible with this GPU.")
-    sageattn_func = None
+    try:
+        sageattn_func = _build_flashattention2_sageattn()
+        SAGEATTN_AVAILABLE = True
+        print("Using FlashAttention2 fallback for SageAttention")
+    except Exception as fallback_err:
+        print(f"Warning: Could not load FlashAttention2 fallback: {fallback_err}")
+        sageattn_func = None

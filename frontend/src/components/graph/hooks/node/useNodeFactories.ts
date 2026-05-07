@@ -46,6 +46,7 @@ type NodeTypeKey =
   | "prompt_list"
   | "prompt_blend"
   | "scheduler"
+  | "text_monitor"
   | "custom_node";
 
 interface NodeDefaults {
@@ -472,6 +473,18 @@ const NODE_DEFAULTS: Record<NodeTypeKey, NodeDefaults> = {
       ],
     },
   },
+  text_monitor: {
+    type: "text_monitor",
+    idPrefix: "text_monitor",
+    defaultX: 50,
+    data: {
+      label: "Text Monitor",
+      nodeType: "text_monitor",
+      textMonitorText: "",
+      parameterInputs: [{ name: "text", type: "string", defaultValue: "" }],
+      parameterOutputs: [{ name: "text", type: "string", defaultValue: "" }],
+    },
+  },
   custom_node: {
     type: "custom_node",
     idPrefix: "custom",
@@ -579,6 +592,7 @@ export function useNodeFactories({
         | "prompt_list"
         | "prompt_blend"
         | "scheduler"
+        | "text_monitor"
         | "custom_node",
       subType?: string,
       extraData?: Partial<FlowNodeData>

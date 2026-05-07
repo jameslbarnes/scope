@@ -73,6 +73,7 @@ type NodeTypeSelectFn = (
     | "prompt_list"
     | "prompt_blend"
     | "scheduler"
+    | "text_monitor"
     | "custom_node",
   subType?: string,
   extraData?: Partial<FlowNodeData>
@@ -288,6 +289,12 @@ export function buildPaneMenuItems(deps: {
           icon: <StickyNote />,
           onClick: () => handleNodeTypeSelect("note"),
           keywords: ["comment", "annotation", "text"],
+        },
+        {
+          label: "Text Monitor",
+          icon: <Type />,
+          onClick: () => handleNodeTypeSelect("text_monitor"),
+          keywords: ["text", "prompt", "monitor", "display", "cue"],
         },
         {
           label: "Bool",

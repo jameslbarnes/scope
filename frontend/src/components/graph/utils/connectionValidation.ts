@@ -64,6 +64,11 @@ const TARGET_RULES: TargetRule[] = [
     if (targetParsedName === "__prompt") return sourceType === "string";
     return undefined;
   },
+  // text monitor – only string into text
+  ({ sourceType, targetParsedName, targetNode }) => {
+    if (targetNode.data.nodeType !== "text_monitor") return undefined;
+    return targetParsedName === "text" && sourceType === "string";
+  },
   // math node – number for a / b
   ({ sourceType, targetParsedName, targetNode }) => {
     if (targetNode.data.nodeType !== "math") return undefined;
@@ -363,12 +368,20 @@ export function validateConnection(
     const targetNode = nodes.find(n => n.id === connection.target);
     if (!sourceNode || !targetNode) return true;
     if (sourceNode.data.nodeType !== "custom_node") return false;
-    if (targetNode.data.nodeType !== "pipeline") return false;
+    if (
+      targetNode.data.nodeType !== "pipeline" &&
+      targetNode.data.nodeType !== "text_monitor"
+    ) {
+      return false;
+    }
     const outputs = sourceNode.data.customNodeOutputs;
     if (outputs === undefined) return true;
     const portName = stripCustomNodeDirection(sourceParsed.name);
     const port = outputs.find(p => p.name === portName);
     if (!port) return false;
+    if (targetNode.data.nodeType === "text_monitor") {
+      return targetParsed.name === "text" && port.port_type === "string";
+    }
     return (
       matchTargetRules(port.port_type, targetNode, targetParsed.name) ??
       matchParameterInputs(port.port_type, targetNode, targetParsed.name) ??

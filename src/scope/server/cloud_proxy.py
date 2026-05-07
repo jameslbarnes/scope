@@ -35,6 +35,7 @@ _LONGLIVE_DEFAULT_HEIGHT = 480
 _LONGLIVE_DEFAULT_WIDTH = 832
 _LONGLIVE_DEFAULT_VAE_TYPE = "lighttae"
 _LONGLIVE_ETHEREA_DENOISING = [1000, 875, 750]
+_SOURCE_PLUGIN_KIND = "source"
 
 
 def _normalize_longlive_pipeline_meta(longlive: Any) -> None:
@@ -80,7 +81,7 @@ def _normalize_legacy_longlive_schema(response: Any) -> Any:
         return response
     _normalize_longlive_pipeline_meta(pipelines.get("longlive"))
 
-    return response
+    return _merge_local_source_pipeline_schemas(response)
 
 
 def _normalize_legacy_longlive_node_definitions(response: Any) -> Any:
@@ -94,6 +95,113 @@ def _normalize_legacy_longlive_node_definitions(response: Any) -> Any:
             continue
         if node.get("node_type_id") == "longlive":
             _normalize_longlive_pipeline_meta(node.get("pipeline_meta"))
+    return _merge_local_source_node_definitions(response)
+
+
+def _local_source_plugin_names() -> set[str]:
+    try:
+        from scope.core.plugins import get_plugin_manager
+
+        plugin_manager = get_plugin_manager()
+        local_plugins = plugin_manager.list_plugins_sync(skip_update_check=True)
+        return {
+            plugin.get("name")
+            for plugin in local_plugins
+            if plugin.get("kind") == _SOURCE_PLUGIN_KIND
+        }
+    except Exception as e:
+        logger.warning("Failed to list local source plugins: %s", e)
+        return set()
+
+
+def _local_source_pipeline_schemas() -> dict[str, dict[str, Any]]:
+    """Return local pipeline schemas that must remain local in cloud mode."""
+
+    try:
+        from scope.core.nodes.registry import NodeRegistry
+        from scope.core.plugins import get_plugin_manager
+
+        plugin_manager = get_plugin_manager()
+        source_plugins = _local_source_plugin_names()
+        if not source_plugins:
+            return {}
+
+        schemas: dict[str, dict[str, Any]] = {}
+        for definition in NodeRegistry.get_all_definitions():
+            if definition.pipeline_meta is None:
+                continue
+            plugin_name = plugin_manager.get_plugin_for_type_id(
+                definition.node_type_id
+            )
+            if plugin_name not in source_plugins:
+                continue
+            schema_data = dict(definition.pipeline_meta or {})
+            schema_data["plugin_name"] = plugin_name
+            schemas[definition.node_type_id] = schema_data
+        return schemas
+    except Exception as e:
+        logger.warning("Failed to merge local source pipeline schemas: %s", e)
+        return {}
+
+
+def _merge_local_source_pipeline_schemas(response: dict[str, Any]) -> dict[str, Any]:
+    pipelines = response.get("pipelines")
+    if not isinstance(pipelines, dict):
+        return response
+
+    local_pipelines = _local_source_pipeline_schemas()
+    if not local_pipelines:
+        return response
+
+    response["pipelines"] = {**pipelines, **local_pipelines}
+    return response
+
+
+def _local_source_node_definitions() -> list[dict[str, Any]]:
+    """Return local node definitions that must remain local in cloud mode."""
+
+    try:
+        from scope.core.nodes.registry import NodeRegistry
+        from scope.core.plugins import get_plugin_manager
+
+        plugin_manager = get_plugin_manager()
+        source_plugins = _local_source_plugin_names()
+        if not source_plugins:
+            return []
+
+        definitions: list[dict[str, Any]] = []
+        for definition in NodeRegistry.get_all_definitions():
+            plugin_name = plugin_manager.get_plugin_for_type_id(
+                definition.node_type_id
+            )
+            if plugin_name not in source_plugins:
+                continue
+            payload = definition.model_dump()
+            payload["plugin_name"] = plugin_name
+            definitions.append(payload)
+        return definitions
+    except Exception as e:
+        logger.warning("Failed to merge local source node definitions: %s", e)
+        return []
+
+
+def _merge_local_source_node_definitions(response: dict[str, Any]) -> dict[str, Any]:
+    nodes = response.get("nodes")
+    if not isinstance(nodes, list):
+        return response
+
+    local_nodes = _local_source_node_definitions()
+    if not local_nodes:
+        return response
+
+    local_ids = {
+        node.get("node_type_id") for node in local_nodes if isinstance(node, dict)
+    }
+    response["nodes"] = [
+        node
+        for node in nodes
+        if not (isinstance(node, dict) and node.get("node_type_id") in local_ids)
+    ] + local_nodes
     return response
 
 

@@ -23,6 +23,7 @@ class SyphonSender:
         self.server = None
         self._texture = None
         self._copy_image_to_mtl_texture = None
+        self._frame_count = 0
 
     def create(self) -> bool:
         """Create and initialize the Syphon sender."""
@@ -41,6 +42,7 @@ class SyphonSender:
             logger.info(
                 f"SyphonSender '{self.name}' created ({self.width}x{self.height})"
             )
+            self._broadcast_announce()
             return True
         except ImportError:
             logger.error("syphon-python not available")
@@ -72,6 +74,9 @@ class SyphonSender:
                 size=(self.width, self.height),
                 is_flipped=True,
             )
+            self._frame_count += 1
+            if self._frame_count == 1 or self._frame_count % 60 == 0:
+                self._broadcast_announce()
             return True
         except Exception as e:
             logger.error(f"Error sending Syphon frame: {e}")
@@ -91,6 +96,7 @@ class SyphonSender:
             )
         else:
             logger.info(f"SyphonSender '{self.name}' resized to {width}x{height}")
+            self._broadcast_announce()
 
     def release(self):
         """Release Syphon sender resources."""
@@ -104,6 +110,7 @@ class SyphonSender:
                 self.server = None
                 self._texture = None
                 self._copy_image_to_mtl_texture = None
+                self._frame_count = 0
 
     def _create_texture(self, width: int, height: int):
         """Create an RGBA Metal texture used as the publish buffer."""
@@ -174,3 +181,15 @@ class SyphonSender:
             frame = np.concatenate([frame, alpha], axis=2)
 
         return frame
+
+    def _broadcast_announce(self):
+        """Re-announce the server for clients that were opened after creation."""
+        if self.server is None:
+            return
+        try:
+            context = getattr(self.server, "context", None)
+            announce = getattr(context, "broadcastServerAnnounce", None)
+            if callable(announce):
+                announce()
+        except Exception as e:
+            logger.debug(f"Could not broadcast Syphon announcement: {e}")

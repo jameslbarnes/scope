@@ -31,6 +31,7 @@ import {
   COLOR_AUDIO,
   COLOR_DEFAULT,
 } from "../nodeColors";
+import { ShaderClawWidget } from "./ShaderClawWidget";
 
 type PipelineNodeType = Node<FlowNodeData, "pipeline">;
 
@@ -87,8 +88,20 @@ export function PipelineNode({
   const supportsVace = data.supportsVace ?? false;
   const supportsLoRA = data.supportsLoRA ?? false;
   const isStreaming = data.isStreaming ?? false;
+  const pipelineId = String(data.pipelineId ?? "").trim();
+  const shaderClawManagedParams = new Set([
+    "shader",
+    "parameters_json",
+    "reload_token",
+  ]);
+  const isShaderClaw =
+    pipelineId === "shaderclaw-3" ||
+    (parameterInputs.some(param => param.name === "shaderclaw_url") &&
+      parameterInputs.some(param =>
+        shaderClawManagedParams.has(param.name)
+      ));
 
-  const pipelineName = data.pipelineId || "Pipeline";
+  const pipelineName = pipelineId || "Pipeline";
 
   // Inject unavailable pipelineId into options
   const isUnavailable =
@@ -150,7 +163,10 @@ export function PipelineNode({
 
   const listParams = parameterInputs.filter(p => p.type === "list_number");
   const primitiveParams = parameterInputs.filter(
-    p => p.type !== "list_number" && p.name !== "reset_cache"
+    p =>
+      p.type !== "list_number" &&
+      p.name !== "reset_cache" &&
+      !(isShaderClaw && shaderClawManagedParams.has(p.name))
   );
   const isResetCacheConnected = isParamConnected("reset_cache");
 
@@ -255,6 +271,14 @@ export function PipelineNode({
                 )}
               </NodeParamRow>
             </div>
+          )}
+
+          {isShaderClaw && (
+            <ShaderClawWidget
+              nodeId={id}
+              parameterValues={parameterValues}
+              onParameterChange={onParameterChange}
+            />
           )}
 
           {/* Primitive parameters (string, number, boolean) */}

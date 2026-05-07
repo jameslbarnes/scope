@@ -45,6 +45,7 @@ interface AddNodeModalProps {
       | "prompt_list"
       | "prompt_blend"
       | "scheduler"
+      | "text_monitor"
       | "custom_node",
     subType?: string,
     extraData?: Partial<FlowNodeData>
@@ -79,6 +80,7 @@ interface NodeCatalogItem {
     | "prompt_list"
     | "prompt_blend"
     | "scheduler"
+    | "text_monitor"
     | "custom_node";
   subType?: string;
   name: string;
@@ -201,6 +203,13 @@ const NODE_CATALOG: NodeCatalogItem[] = [
     type: "note",
     name: "Note",
     description: "Add a text annotation to the graph",
+    color: "#fbbf24",
+    category: "Utility",
+  },
+  {
+    type: "text_monitor",
+    name: "Text Monitor",
+    description: "Display a live upstream string such as the current Cue prompt",
     color: "#fbbf24",
     category: "Utility",
   },

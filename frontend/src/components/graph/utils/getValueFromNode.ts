@@ -1,6 +1,22 @@
 import type { Node } from "@xyflow/react";
 import type { FlowNodeData } from "../../../lib/graphUtils";
-import { parseHandleId } from "../../../lib/graphUtils";
+import {
+  parseHandleId,
+  stripCustomNodeDirection,
+} from "../../../lib/graphUtils";
+
+function customNodeOutputValue(
+  node: Node<FlowNodeData>,
+  sourceHandleId?: string | null
+): unknown {
+  const values = node.data.customNodeOutputValues as
+    | Record<string, unknown>
+    | undefined;
+  if (!values || !sourceHandleId) return null;
+  const parsed = parseHandleId(sourceHandleId);
+  if (!parsed) return null;
+  return values[stripCustomNodeDirection(parsed.name)] ?? null;
+}
 
 /**
  * Extract a numeric value from a producer node given the source handle.
@@ -88,6 +104,10 @@ export function getNumberFromNode(
       return (node.data.tempoIsPlaying as boolean) ? 1 : 0;
     return null;
   }
+  if (t === "custom_node") {
+    const val = customNodeOutputValue(node, sourceHandleId);
+    return typeof val === "number" ? val : null;
+  }
   // Boundary input / subgraph — read from portValues
   if (t === "subgraph_input" || t === "subgraph") {
     const pv = node.data.portValues as Record<string, unknown> | undefined;
@@ -124,6 +144,13 @@ export function getStringFromNode(
       | { text: string; weight: number }[]
       | undefined;
     return items?.[0]?.text ?? null;
+  }
+  if (t === "text_monitor") {
+    return (node.data.textMonitorText as string) ?? null;
+  }
+  if (t === "custom_node") {
+    const val = customNodeOutputValue(node, sourceHandleId);
+    return typeof val === "string" ? val : null;
   }
   if (t === "subgraph_input" || t === "subgraph") {
     const pv = node.data.portValues as Record<string, unknown> | undefined;
@@ -255,6 +282,12 @@ export function getAnyValueFromNode(
   }
   if (t === "audio") {
     return node.data.audioPath || null;
+  }
+  if (t === "text_monitor") {
+    return node.data.textMonitorText ?? "";
+  }
+  if (t === "custom_node") {
+    return customNodeOutputValue(node, sourceHandleId);
   }
   if (t === "subgraph" || t === "subgraph_input") {
     const pv = node.data.portValues as Record<string, unknown> | undefined;

@@ -14,6 +14,7 @@ from aiortc import (
     RTCDataChannel,
     RTCIceServer,
     RTCPeerConnection,
+    RTCRtpSender,
     RTCSessionDescription,
 )
 from aiortc.codecs import h264, vpx
@@ -44,19 +45,76 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# TODO: Fix bitrate
-# Monkey patching these values in aiortc don't seem to work as expected
-# The expected behavior is for the bitrate calculations to set a bitrate based on the ceiling, floor and defaults
-# For now, these values were set kind of arbitrarily to increase the bitrate
-h264.MAX_FRAME_RATE = 8
-h264.DEFAULT_BITRATE = 7000000
-h264.MIN_BITRATE = 5000000
-h264.MAX_BITRATE = 10000000
+WEBRTC_MAX_FRAME_RATE_HINT = int(os.getenv("SCOPE_WEBRTC_MAX_FRAME_RATE_HINT", "30"))
+WEBRTC_DEFAULT_BITRATE = int(os.getenv("SCOPE_WEBRTC_DEFAULT_BITRATE", "18000000"))
+WEBRTC_MIN_BITRATE = int(os.getenv("SCOPE_WEBRTC_MIN_BITRATE", "8000000"))
+WEBRTC_MAX_BITRATE = int(os.getenv("SCOPE_WEBRTC_MAX_BITRATE", "30000000"))
+WEBRTC_PREFER_H264 = os.getenv("SCOPE_WEBRTC_PREFER_H264", "0").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
 
-vpx.MAX_FRAME_RATE = 8
-vpx.DEFAULT_BITRATE = 7000000
-vpx.MIN_BITRATE = 5000000
-vpx.MAX_BITRATE = 10000000
+# aiortc's built-in defaults are tuned for ordinary calls, not full-frame AI
+# video. Scope relays remote inference through two WebRTC hops, so keep the
+# encoder target high enough to avoid blockiness after re-encoding.
+h264.MAX_FRAME_RATE = WEBRTC_MAX_FRAME_RATE_HINT
+h264.DEFAULT_BITRATE = WEBRTC_DEFAULT_BITRATE
+h264.MIN_BITRATE = WEBRTC_MIN_BITRATE
+h264.MAX_BITRATE = WEBRTC_MAX_BITRATE
+
+vpx.MAX_FRAME_RATE = WEBRTC_MAX_FRAME_RATE_HINT
+vpx.DEFAULT_BITRATE = WEBRTC_DEFAULT_BITRATE
+vpx.MIN_BITRATE = WEBRTC_MIN_BITRATE
+vpx.MAX_BITRATE = WEBRTC_MAX_BITRATE
+
+
+def _prefer_h264_for_video_transceivers(pc: RTCPeerConnection, label: str) -> None:
+    """Prefer H264 over VP8 for AI video relay quality when both peers support it."""
+    if not WEBRTC_PREFER_H264:
+        return
+    codecs = RTCRtpSender.getCapabilities("video").codecs
+    h264_codecs = [
+        codec for codec in codecs if codec.mimeType.lower() == "video/h264"
+    ]
+    if not h264_codecs:
+        return
+    codec_preferences = h264_codecs + [
+        codec for codec in codecs if codec.mimeType.lower() != "video/h264"
+    ]
+
+    applied = 0
+    for transceiver in pc.getTransceivers():
+        if transceiver.kind != "video":
+            continue
+        try:
+            transceiver.setCodecPreferences(codec_preferences)
+            applied += 1
+        except Exception as exc:
+            logger.debug("Could not prefer H264 for %s: %s", label, exc)
+    if applied:
+        logger.info("Preferred H264 for %s video transceiver(s): %s", applied, label)
+
+
+def _expects_webrtc_video_input(
+    initial_parameters: dict[str, Any],
+    source_node_ids: list[str],
+) -> bool:
+    """Return whether this session should receive browser/client video RTP."""
+    return bool(source_node_ids) or initial_parameters.get("input_mode") == "video"
+
+
+def _mark_video_outputs_sendonly(pc: RTCPeerConnection, label: str) -> None:
+    """Do not negotiate inbound video when this session has no video source."""
+    applied = 0
+    for transceiver in pc.getTransceivers():
+        if transceiver.kind != "video" or transceiver.sender.track is None:
+            continue
+        transceiver.direction = "sendonly"
+        applied += 1
+    if applied:
+        logger.info("Marked %s video output transceiver(s) sendonly: %s", applied, label)
 
 
 def _build_extra_output_tracks(
@@ -391,6 +449,10 @@ class WebRTCManager:
             all_source_node_ids_for_routing = initial_parameters.get(
                 "source_track_order", webrtc_source_node_ids
             )
+            expects_webrtc_video_input = _expects_webrtc_video_input(
+                initial_parameters,
+                all_source_node_ids_for_routing,
+            )
 
             # If the graph has pipeline nodes, ensure they are loaded keyed by
             # node_id so build_graph can find them via node.id.  The pipeline
@@ -571,6 +633,12 @@ class WebRTCManager:
             def on_track(track: MediaStreamTrack):
                 logger.info(f"Track received: {track.kind} for session {session.id}")
                 if track.kind == "video" and video_track is not None:
+                    if not expects_webrtc_video_input:
+                        logger.info(
+                            "Ignoring browser video track; session has no WebRTC "
+                            "video input"
+                        )
+                        return
                     if all_source_node_ids_for_routing:
                         # Multi-source: route each incoming browser track via
                         # SourceInputHandler (one track per file/camera source;
@@ -730,9 +798,9 @@ class WebRTCManager:
                     and t.receiver.track is None
                 ]
                 for i, extra_track in enumerate(extra_output_tracks):
-                    session.additional_tracks.append(extra_track)
-                    relayed = relay.subscribe(extra_track)
                     if i < len(recv_only_video):
+                        session.additional_tracks.append(extra_track)
+                        relayed = relay.subscribe(extra_track)
                         t = recv_only_video[i]
                         t.sender.replaceTrack(relayed)
                         t.direction = "sendonly"
@@ -740,8 +808,15 @@ class WebRTCManager:
                             f"Attached extra output track on transceiver mid={t.mid}"
                         )
                     else:
-                        pc.addTrack(relayed)
-                        logger.info("Attached extra output track via addTrack fallback")
+                        logger.warning(
+                            "Skipping extra output track; offer has no unused "
+                            "recvonly video transceiver"
+                        )
+
+            if not expects_webrtc_video_input:
+                _mark_video_outputs_sendonly(pc, "local")
+
+            _prefer_h264_for_video_transceivers(pc, "local")
 
             # Create answer
             answer = await pc.createAnswer()
@@ -834,6 +909,10 @@ class WebRTCManager:
                 record_node_ids,
                 has_non_webrtc_sources,
             ) = _parse_graph_node_ids(initial_parameters)
+            expects_webrtc_video_input = _expects_webrtc_video_input(
+                initial_parameters,
+                webrtc_source_node_ids,
+            )
 
             # Determine media modalities from initial_parameters. These are
             # set by the frontend from the pipeline/status endpoint, which is
@@ -942,6 +1021,12 @@ class WebRTCManager:
             def on_track(track: MediaStreamTrack):
                 logger.info(f"Track received: {track.kind} for session {session.id}")
                 if track.kind == "video" and cloud_track is not None:
+                    if not expects_webrtc_video_input:
+                        logger.info(
+                            "Ignoring browser video track; session has no WebRTC "
+                            "video input"
+                        )
+                        return
                     # When all sources are server-side hardware (Syphon/NDI/
                     # Spout), ignore the browser video track — it carries no
                     # useful data and would collide with hardware-source frames
@@ -1088,11 +1173,13 @@ class WebRTCManager:
                     f"transceivers for {len(sink_node_ids) - 1} extra sink(s)"
                 )
                 for i, sink_id in enumerate(sink_node_ids[1:]):
-                    extra_track = CloudSinkOutputTrack(frame_processor=frame_processor)
-                    extra_sink_tracks.append(extra_track)
-                    session.additional_tracks.append(extra_track)
-                    relayed = relay.subscribe(extra_track)
                     if i < len(recv_only_video):
+                        extra_track = CloudSinkOutputTrack(
+                            frame_processor=frame_processor
+                        )
+                        extra_sink_tracks.append(extra_track)
+                        session.additional_tracks.append(extra_track)
+                        relayed = relay.subscribe(extra_track)
                         tv = recv_only_video[i]
                         tv.sender.replaceTrack(relayed)
                         tv.direction = "sendonly"
@@ -1100,10 +1187,16 @@ class WebRTCManager:
                             f"Cloud relay: extra sink {sink_id} on mid={tv.mid}"
                         )
                     else:
-                        pc.addTrack(relayed)
-                        logger.info(f"Cloud relay: extra sink {sink_id} via addTrack")
+                        logger.warning(
+                            "Skipping browser relay for extra sink %s; offer has no "
+                            "unused recvonly video transceiver",
+                            sink_id,
+                        )
                 # Tell CloudTrack to wire these after cloud connection starts
                 cloud_track.set_extra_sink_tracks(extra_sink_tracks)
+
+            if not expects_webrtc_video_input:
+                _mark_video_outputs_sendonly(pc, "cloud relay")
 
             # Set up record node callbacks so cloud record frames are
             # received locally and fed into frame_processor record queues.
@@ -1127,6 +1220,8 @@ class WebRTCManager:
                     f"Cloud relay: registered {len(record_callbacks)} "
                     f"record callback(s)"
                 )
+
+            _prefer_h264_for_video_transceivers(pc, "cloud relay")
 
             # Create answer
             answer = await pc.createAnswer()
@@ -1312,21 +1407,25 @@ class WebRTCManager:
         for session in self.sessions.values():
             if session.pc.connectionState in ("closed", "failed"):
                 continue
+            session_parameters = dict(parameters)
             if "paused" in parameters:
                 if session.video_track:
                     session.video_track.pause(parameters["paused"])
                 elif session.frame_processor:
                     session.frame_processor.paused = parameters["paused"]
+            if session.video_track and hasattr(session.video_track, "update_parameters"):
+                session.video_track.update_parameters(session_parameters)
+                continue
             if (
                 session.video_track
                 and hasattr(session.video_track, "frame_processor")
                 and session.video_track.frame_processor
             ):
-                session.video_track.frame_processor.update_parameters(parameters)
+                session.video_track.frame_processor.update_parameters(session_parameters)
             elif session.frame_processor:
-                session.frame_processor.update_parameters(parameters)
+                session.frame_processor.update_parameters(session_parameters)
         if self.headless_session and self.headless_session.frame_processor:
-            self.headless_session.frame_processor.update_parameters(parameters)
+            self.headless_session.frame_processor.update_parameters(dict(parameters))
 
     def broadcast_notification(self, message: dict) -> None:
         """Send a notification to active sessions via their data channels.

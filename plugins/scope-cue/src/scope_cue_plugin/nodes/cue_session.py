@@ -18,12 +18,22 @@ DEFAULT_ACTION_TYPE = "video.update_prompt"
 DEFAULT_INPUT_MAPPING = {
     "chat": "transcript.segment",
     "chat_in": "transcript.segment",
+    "transcript": "transcript.segment",
+    "vision": "vision.description",
+    "signal": "signal.value",
+    "context": "scope.context",
     "context_json": "scope.context",
+    "control": "scope.control",
 }
 DEFAULT_OUTPUT_MAPPING = {
     "prompt": "longlive.prompt",
+    "reset": "longlive.reset_cache",
     "transcript": "chat.transcript",
+    "action": "cue.action",
     "action_json": "cue.action",
+    "param_patch": "scope.params",
+    "shader_patch": "scope.shader",
+    "source": "scope.source",
 }
 
 
@@ -45,9 +55,9 @@ class CueSessionNode(BaseNode):
     def get_definition(cls) -> NodeDefinition:
         return NodeDefinition(
             node_type_id=cls.node_type_id,
-            display_name="Cue Session",
+            display_name="Cue Director",
             category="cue",
-            description="Poll a Cue session and expose transcript and prompt actions.",
+            description="Operate a Cue session as a live chat, observation, and action director.",
             continuous=True,
             inputs=[
                 NodePort(
@@ -57,16 +67,34 @@ class CueSessionNode(BaseNode):
                     description="Force an immediate Cue state poll",
                 ),
                 NodePort(
-                    name="chat_in",
+                    name="transcript",
                     port_type="string",
                     required=False,
-                    description="Forward upstream text into Cue as a transcript segment",
+                    description="Forward upstream speech or chat text into Cue",
                 ),
                 NodePort(
-                    name="context_json",
+                    name="vision",
+                    port_type="string",
+                    required=False,
+                    description="Forward visual descriptions or VLM output into Cue",
+                ),
+                NodePort(
+                    name="signal",
+                    port_type="string",
+                    required=False,
+                    description="Forward signal JSON into Cue",
+                ),
+                NodePort(
+                    name="context",
                     port_type="string",
                     required=False,
                     description="Forward upstream structured context into Cue",
+                ),
+                NodePort(
+                    name="control",
+                    port_type="string",
+                    required=False,
+                    description="Forward control observations into Cue",
                 ),
             ],
             outputs=[
@@ -83,16 +111,34 @@ class CueSessionNode(BaseNode):
                     description="Latest matching Cue prompt reset flag",
                 ),
                 NodePort(
-                    name="action_json",
+                    name="action",
                     port_type="string",
                     required=False,
-                    description="Latest matching Cue action serialized as JSON",
+                    description="Latest Cue action serialized as JSON",
+                ),
+                NodePort(
+                    name="param_patch",
+                    port_type="string",
+                    required=False,
+                    description="Latest parameter patch action payload serialized as JSON",
+                ),
+                NodePort(
+                    name="shader_patch",
+                    port_type="string",
+                    required=False,
+                    description="Latest shader patch action payload serialized as JSON",
                 ),
                 NodePort(
                     name="transcript",
                     port_type="string",
                     required=False,
                     description="Current Cue transcript snapshot",
+                ),
+                NodePort(
+                    name="source",
+                    port_type="string",
+                    required=False,
+                    description="Latest Cue output/source availability serialized as JSON",
                 ),
                 NodePort(
                     name="status",
@@ -107,28 +153,10 @@ class CueSessionNode(BaseNode):
                     description="Increments when observed Cue state changes",
                 ),
                 NodePort(
-                    name="decision_count",
-                    port_type="number",
-                    required=False,
-                    description="Cue decision count snapshot",
-                ),
-                NodePort(
-                    name="observation_count",
-                    port_type="number",
-                    required=False,
-                    description="Cue observation count snapshot",
-                ),
-                NodePort(
-                    name="chat_status",
+                    name="decision",
                     port_type="string",
                     required=False,
-                    description="Status of chat and mapped input submissions",
-                ),
-                NodePort(
-                    name="mapping_json",
-                    port_type="string",
-                    required=False,
-                    description="Current Cue input/output mapping serialized as JSON",
+                    description="Latest Cue decision summary serialized as JSON",
                 ),
             ],
             params=[
@@ -137,42 +165,54 @@ class CueSessionNode(BaseNode):
                     param_type="string",
                     default=os.environ.get("CUE_BASE_URL", DEFAULT_CUE_BASE_URL),
                     description="Cue server base URL",
-                    ui={"section": "connection"},
+                    ui={"widget": "cue_hidden", "section": "connection"},
                 ),
                 NodeParam(
                     name="session_id",
                     param_type="string",
                     default=os.environ.get("CUE_SESSION_ID", DEFAULT_SESSION_ID),
                     description="Cue session id",
-                    ui={"section": "connection"},
+                    ui={"widget": "cue_hidden", "section": "connection"},
                 ),
                 NodeParam(
                     name="action_type",
                     param_type="string",
                     default=DEFAULT_ACTION_TYPE,
                     description="Cue action type to expose",
-                    ui={"section": "connection"},
+                    ui={"widget": "cue_hidden", "section": "connection"},
                 ),
                 NodeParam(
                     name="poll_interval_ms",
                     param_type="number",
                     default=250,
                     description="Polling interval",
-                    ui={"min": 50, "max": 5000, "step": 50, "section": "connection"},
+                    ui={
+                        "widget": "cue_hidden",
+                        "min": 50,
+                        "max": 5000,
+                        "step": 50,
+                        "section": "connection",
+                    },
                 ),
                 NodeParam(
                     name="timeout_ms",
                     param_type="number",
                     default=500,
                     description="HTTP timeout",
-                    ui={"min": 50, "max": 5000, "step": 50, "section": "connection"},
+                    ui={
+                        "widget": "cue_hidden",
+                        "min": 50,
+                        "max": 5000,
+                        "step": 50,
+                        "section": "connection",
+                    },
                 ),
                 NodeParam(
                     name="enabled",
                     param_type="boolean",
                     default=True,
                     description="Enable Cue polling",
-                    ui={"section": "connection"},
+                    ui={"widget": "cue_hidden", "section": "connection"},
                 ),
                 NodeParam(
                     name="cue_file_path",
@@ -219,6 +259,14 @@ class CueSessionNode(BaseNode):
                     param_type="number",
                     default=0,
                     description="Monotonic chat submit counter",
+                    ui={"widget": "cue_hidden", "section": "cue_ui"},
+                    convertible_to_input=False,
+                ),
+                NodeParam(
+                    name="style_tags_json",
+                    param_type="string",
+                    default="[]",
+                    description="Cue style tags serialized as JSON",
                     ui={"widget": "cue_hidden", "section": "cue_ui"},
                     convertible_to_input=False,
                 ),
@@ -297,23 +345,25 @@ class CueSessionNode(BaseNode):
         input_mapping = _json_object(
             params.get("input_mapping_json"), DEFAULT_INPUT_MAPPING
         )
-        if "chat_in" in inputs:
-            text = _string(inputs.get("chat_in")).strip()
+        text_ports = ("transcript", "chat_in")
+        for port_name in text_ports:
+            text = _string(inputs.get(port_name)).strip()
             if text:
                 statuses.append(
                     self._post_deduped_input(
-                        "chat_in",
+                        port_name,
                         text,
                         input_mapping,
                         connection,
                     )
                 )
-        if "context_json" in inputs:
-            text = _string(inputs.get("context_json")).strip()
+
+        for port_name in ("vision", "signal", "context", "context_json", "control"):
+            text = _string(inputs.get(port_name)).strip()
             if text:
                 statuses.append(
                     self._post_deduped_input(
-                        "context_json",
+                        port_name,
                         text,
                         input_mapping,
                         connection,
@@ -482,17 +532,27 @@ def _json_object(value: Any, default: dict[str, Any]) -> dict[str, Any]:
 
 def _outputs_from_state(state: dict[str, Any], *, action_type: str) -> dict[str, Any]:
     snapshot = _object(state.get("state"))
-    latest_action = _latest_matching_action(state, action_type)
-    action_payload = _object(latest_action.get("payload")) if latest_action else {}
+    matching_action = _latest_matching_action(state, action_type)
+    latest_action = matching_action or _latest_any_action(state)
+    action_payload = _object(matching_action.get("payload")) if matching_action else {}
     prompt = action_payload.get("prompt")
     reset = action_payload.get("reset")
+    decision = _latest_decision_summary(state)
+    source = _latest_available_source(state)
+    param_patch = _payload_for_action(latest_action, "params")
+    shader_patch = _payload_for_action(latest_action, "shader")
 
     return {
         "prompt": prompt if isinstance(prompt, str) else "",
         "reset": bool(reset) if reset is not None else False,
+        "action": _compact_json(latest_action) if latest_action else "",
         "action_json": _compact_json(latest_action) if latest_action else "",
+        "param_patch": _compact_json(param_patch) if param_patch else "",
+        "shader_patch": _compact_json(shader_patch) if shader_patch else "",
         "transcript": _string(snapshot.get("transcript")),
+        "source": _compact_json(source) if source else "",
         "status": "ok",
+        "decision": _compact_json(decision) if decision else "",
         "decision_count": _as_float(snapshot.get("decisionCount"), 0),
         "observation_count": _as_float(snapshot.get("observationCount"), 0),
     }
@@ -515,6 +575,55 @@ def _latest_matching_action(
                 action_object = _object(action)
                 if action_object.get("type") == action_type:
                     return action_object
+    return None
+
+
+def _latest_any_action(state: dict[str, Any]) -> dict[str, Any] | None:
+    for collection_name in ("decisionHistory", "decisionTrace"):
+        collection = state.get(collection_name)
+        if not isinstance(collection, list):
+            continue
+        for item in reversed(collection):
+            candidate = _object(item)
+            result = _object(candidate.get("result"))
+            actions = result.get("actions")
+            if not isinstance(actions, list) or not actions:
+                continue
+            return _object(actions[-1])
+    return None
+
+
+def _payload_for_action(action: dict[str, Any] | None, keyword: str) -> dict[str, Any]:
+    if not action:
+        return {}
+    action_type = _string(action.get("type"))
+    if keyword not in action_type:
+        return {}
+    return _object(action.get("payload"))
+
+
+def _latest_decision_summary(state: dict[str, Any]) -> dict[str, Any] | None:
+    for collection_name in ("decisionHistory", "decisionTrace"):
+        collection = state.get(collection_name)
+        if not isinstance(collection, list) or not collection:
+            continue
+        item = _object(collection[-1])
+        result = _object(item.get("result"))
+        return {
+            "tool": item.get("tool") or item.get("toolName") or result.get("tool"),
+            "status": result.get("status"),
+            "actions": result.get("actions") if isinstance(result.get("actions"), list) else [],
+        }
+    return None
+
+
+def _latest_available_source(state: dict[str, Any]) -> dict[str, Any] | None:
+    for key in ("outputs", "sources", "availableOutputs", "availableSources"):
+        value = state.get(key)
+        if isinstance(value, list) and value:
+            return _object(value[-1])
+        if isinstance(value, dict) and value:
+            return value
     return None
 
 

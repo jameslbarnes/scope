@@ -73,6 +73,8 @@ const PRODUCER_TYPES = new Set<FlowNodeData["nodeType"]>([
   "prompt_list",
   "prompt_blend",
   "scheduler",
+  "custom_node",
+  "text_monitor",
 ]);
 
 const UI_INPUT_TYPES = new Set<FlowNodeData["nodeType"]>([
@@ -90,6 +92,7 @@ const UI_INPUT_TYPES = new Set<FlowNodeData["nodeType"]>([
   "prompt_list",
   "prompt_blend",
   "scheduler",
+  "text_monitor",
 ]);
 
 function resolveSubgraphTarget(
@@ -395,6 +398,17 @@ export function useValueForwarding(
         for (const [port, count] of Object.entries(fireCounts)) {
           valuesToForward.push({ handleName: port, value: count });
         }
+      } else if (node.data.nodeType === "custom_node") {
+        const values =
+          (node.data.customNodeOutputValues as Record<string, unknown>) ?? {};
+        for (const [key, val] of Object.entries(values)) {
+          valuesToForward.push({ handleName: key, value: val });
+        }
+      } else if (node.data.nodeType === "text_monitor") {
+        valuesToForward.push({
+          handleName: "text",
+          value: node.data.textMonitorText ?? "",
+        });
       } else if (
         node.data.nodeType === "subgraph_input" ||
         node.data.nodeType === "subgraph"
@@ -421,7 +435,17 @@ export function useValueForwarding(
         if (edge.source !== node.id) continue;
         const sourceParsed = parseHandleId(edge.sourceHandle);
         const targetParsed = parseHandleId(edge.targetHandle);
-        if (!sourceParsed || sourceParsed.kind !== "param") continue;
+        if (!sourceParsed) continue;
+        const sourceHandleName =
+          node.data.nodeType === "custom_node"
+            ? stripCustomNodeDirection(sourceParsed.name)
+            : sourceParsed.name;
+        if (
+          sourceParsed.kind !== "param" &&
+          !(node.data.nodeType === "custom_node" && sourceParsed.kind === "stream")
+        ) {
+          continue;
+        }
         if (!targetParsed) continue;
 
         const targetNode = nodes.find(n => n.id === edge.target);
@@ -478,9 +502,14 @@ export function useValueForwarding(
 
         const entry = valuesToForward.find(v => {
           if (v.handleName === null) return true; // single-output node
-          return v.handleName === sourceParsed.name;
+          return v.handleName === sourceHandleName;
         });
         if (!entry || entry.value === undefined) continue;
+
+        if (resolvedParamName === "reset_cache" && entry.value !== true) {
+          lastSentRef.current.delete(`${resolvedBackendId}\0${resolvedParamName}`);
+          continue;
+        }
 
         if (resolvedParamName === "__prompt") {
           // Keep nodeParams.__prompt in sync immediately so
@@ -622,7 +651,13 @@ export function useValueForwarding(
         if (!sourceNode) continue;
 
         const sourceParsed = parseHandleId(edge.sourceHandle);
-        if (!sourceParsed || sourceParsed.kind !== "param") continue;
+        if (!sourceParsed) continue;
+        const isCustomNodeStreamOutput =
+          sourceNode.data.nodeType === "custom_node" &&
+          sourceParsed.kind === "stream";
+        if (sourceParsed.kind !== "param" && !isCustomNodeStreamOutput) {
+          continue;
+        }
 
         const sourceValue = getAnyValueFromNode(sourceNode, edge.sourceHandle);
         // VACE image inputs treat a null/undefined upstream value as an
@@ -634,9 +669,13 @@ export function useValueForwarding(
           (targetParsed.name === "ref_image" ||
             targetParsed.name === "first_frame" ||
             targetParsed.name === "last_frame");
+        const isTextMonitorInput =
+          targetNode.data.nodeType === "text_monitor" &&
+          targetParsed.name === "text";
         if (
           (sourceValue === undefined || sourceValue === null) &&
-          !isVaceImageInput
+          !isVaceImageInput &&
+          !isTextMonitorInput
         )
           continue;
 
@@ -726,6 +765,12 @@ export function useValueForwarding(
           }
         } else if (targetNode.data.nodeType === "reroute") {
           nodeUpdates["value"] = sourceValue;
+        } else if (
+          targetNode.data.nodeType === "text_monitor" &&
+          targetParsed.name === "text"
+        ) {
+          nodeUpdates["textMonitorText"] =
+            sourceValue == null ? "" : String(sourceValue);
         } else if (
           targetNode.data.nodeType === "record" &&
           targetParsed.name === "trigger"
@@ -1021,6 +1066,18 @@ export function useValueForwarding(
             nodeUpdates[dataField] = "";
             updates.set(node.id, nodeUpdates);
           }
+        }
+      }
+
+      for (const node of currentNodes) {
+        if (node.data.nodeType !== "text_monitor") continue;
+        const hasTextEdge = currentEdges.some(
+          e => e.target === node.id && e.targetHandle === "param:text"
+        );
+        if (!hasTextEdge && node.data.textMonitorText) {
+          const nodeUpdates = updates.get(node.id) ?? {};
+          nodeUpdates["textMonitorText"] = "";
+          updates.set(node.id, nodeUpdates);
         }
       }
 

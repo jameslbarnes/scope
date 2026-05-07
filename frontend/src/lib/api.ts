@@ -182,6 +182,31 @@ export const getPipelineStatus = async (): Promise<PipelineStatusResponse> => {
   return result;
 };
 
+export type SessionParameters = Record<string, unknown> & {
+  node_id?: string;
+  prompts?: string[] | PromptItem[];
+  reset_cache?: boolean;
+};
+
+export const updateSessionParameters = async (
+  parameters: SessionParameters
+): Promise<{ status: string; applied_parameters: Record<string, unknown> }> => {
+  const response = await fetch("/api/v1/session/parameters", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(parameters),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(
+      `Session parameter update failed: ${response.status} ${response.statusText}: ${errorText}`
+    );
+  }
+
+  return response.json();
+};
+
 export const checkModelStatus = async (
   pipelineId: string
 ): Promise<ModelStatusResponse> => {
@@ -331,6 +356,8 @@ export interface CueObservationProxyOptions extends CueSessionStateOptions {
   observation: Record<string, unknown>;
 }
 
+export type CueSessionProxyOptions = CueSessionStateOptions;
+
 export const getCueSessionState = async ({
   baseUrl,
   sessionId,
@@ -357,6 +384,115 @@ export const getCueSessionState = async ({
 
   return response.json();
 };
+
+export const resetCueSession = async ({
+  baseUrl,
+  sessionId,
+  timeoutMs = 1000,
+}: CueSessionProxyOptions): Promise<Record<string, unknown>> => {
+  const response = await fetch(
+    `/api/v1/cue/sessions/${encodeURIComponent(sessionId)}/reset`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        base_url: baseUrl,
+        timeout_ms: timeoutMs,
+      }),
+    }
+  );
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(
+      `Cue reset failed: ${response.status} ${response.statusText}: ${errorText}`
+    );
+  }
+
+  return response.json();
+};
+
+export const getCueSessionAgent = async ({
+  baseUrl,
+  sessionId,
+  timeoutMs = 1000,
+}: CueSessionStateOptions): Promise<Record<string, unknown>> => {
+  const params = new URLSearchParams({
+    base_url: baseUrl,
+    timeout_ms: String(timeoutMs),
+  });
+  const response = await fetch(
+    `/api/v1/cue/sessions/${encodeURIComponent(sessionId)}/agent?${params.toString()}`,
+    {
+      method: "GET",
+      headers: { "Content-Type": "application/json" },
+    }
+  );
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(
+      `Cue agent failed: ${response.status} ${response.statusText}: ${errorText}`
+    );
+  }
+
+  return response.json();
+};
+
+export const getCueSessionEventsUrl = ({
+  baseUrl,
+  sessionId,
+  timeoutMs = 1000,
+}: CueSessionStateOptions): string => {
+  return getCueSessionProxyWebSocketUrl({
+    baseUrl,
+    sessionId,
+    timeoutMs,
+    route: "events",
+  });
+};
+
+export const getCueSessionTranscriptionUrl = ({
+  baseUrl,
+  sessionId,
+  timeoutMs = 1000,
+}: CueSessionStateOptions): string => {
+  return getCueSessionProxyWebSocketUrl({
+    baseUrl,
+    sessionId,
+    timeoutMs,
+    route: "transcription",
+  });
+};
+
+export const getCueSessionVlmUrl = ({
+  baseUrl,
+  sessionId,
+  timeoutMs = 1000,
+}: CueSessionStateOptions): string => {
+  return getCueSessionProxyWebSocketUrl({
+    baseUrl,
+    sessionId,
+    timeoutMs,
+    route: "vlm",
+  });
+};
+
+function getCueSessionProxyWebSocketUrl({
+  baseUrl,
+  sessionId,
+  timeoutMs = 1000,
+  route,
+}: CueSessionStateOptions & { route: "events" | "transcription" | "vlm" }): string {
+  const params = new URLSearchParams({
+    base_url: baseUrl,
+    timeout_ms: String(timeoutMs),
+  });
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${protocol}//${window.location.host}/api/v1/cue/sessions/${encodeURIComponent(
+    sessionId
+  )}/${route}?${params.toString()}`;
+}
 
 export const postCueObservation = async ({
   baseUrl,

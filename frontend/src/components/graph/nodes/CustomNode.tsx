@@ -1,6 +1,12 @@
-import { Handle, Position, useEdges, useNodes } from "@xyflow/react";
+import {
+  Handle,
+  Position,
+  useEdges,
+  useNodes,
+  useUpdateNodeInternals,
+} from "@xyflow/react";
 import type { NodeProps, Node } from "@xyflow/react";
-import { useEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef } from "react";
 import type { FlowNodeData } from "../../../lib/graphUtils";
 import {
   customNodeInputHandleId,
@@ -8,7 +14,7 @@ import {
   parseHandleId,
   stripCustomNodeDirection,
 } from "../../../lib/graphUtils";
-import type { NodeParamDef } from "../../../lib/api";
+import type { NodeParamDef, NodePortDef } from "../../../lib/api";
 import { useNodeData } from "../hooks/node/useNodeData";
 import { useNodeCollapse } from "../hooks/node/useNodeCollapse";
 import { useHandlePositions } from "../hooks/node/useHandlePositions";
@@ -49,8 +55,101 @@ const PORT_COLORS: Record<string, string> = {
   lora: "#f472b6",
 };
 
+const CUE_SESSION_INPUTS: NodePortDef[] = [
+  {
+    name: "refresh",
+    port_type: "trigger",
+    description: "Force an immediate Cue state poll",
+  },
+  {
+    name: "transcript",
+    port_type: "string",
+    description: "Forward upstream speech or chat text into Cue",
+  },
+  {
+    name: "vision",
+    port_type: "string",
+    description: "Forward visual descriptions or VLM output into Cue",
+  },
+  {
+    name: "signal",
+    port_type: "string",
+    description: "Forward signal JSON into Cue",
+  },
+  {
+    name: "context",
+    port_type: "string",
+    description: "Forward upstream structured context into Cue",
+  },
+  {
+    name: "control",
+    port_type: "string",
+    description: "Forward control observations into Cue",
+  },
+];
+
+const CUE_SESSION_OUTPUTS: NodePortDef[] = [
+  {
+    name: "prompt",
+    port_type: "string",
+    description: "Latest matching Cue prompt action payload",
+  },
+  {
+    name: "reset",
+    port_type: "boolean",
+    description: "Latest matching Cue prompt reset flag",
+  },
+  {
+    name: "action",
+    port_type: "string",
+    description: "Latest Cue action serialized as JSON",
+  },
+  {
+    name: "param_patch",
+    port_type: "string",
+    description: "Latest parameter patch action payload serialized as JSON",
+  },
+  {
+    name: "shader_patch",
+    port_type: "string",
+    description: "Latest shader patch action payload serialized as JSON",
+  },
+  {
+    name: "transcript",
+    port_type: "string",
+    description: "Current Cue transcript snapshot",
+  },
+  {
+    name: "source",
+    port_type: "string",
+    description: "Latest Cue output/source availability serialized as JSON",
+  },
+  {
+    name: "status",
+    port_type: "string",
+    description: "Cue polling status",
+  },
+  {
+    name: "tick",
+    port_type: "trigger",
+    description: "Increments when observed Cue state changes",
+  },
+  {
+    name: "decision",
+    port_type: "string",
+    description: "Latest Cue decision summary serialized as JSON",
+  },
+];
+
 function portColor(portType: string): string {
   return PORT_COLORS[portType] ?? "#9ca3af";
+}
+
+function cueSessionPortLabel(name: string): string {
+  if (name === "reset") return "reset -> reset_cache";
+  if (name === "param_patch") return "params";
+  if (name === "shader_patch") return "shader";
+  return name;
 }
 
 interface ParamWidgetProps {
@@ -103,13 +202,20 @@ function ParamWidget({ param, value, connected, onChange }: ParamWidgetProps) {
 export function CustomNode({ id, data, selected }: NodeProps<CustomNodeType>) {
   const { updateData } = useNodeData(id);
   const { collapsed, toggleCollapse } = useNodeCollapse();
+  const updateNodeInternals = useUpdateNodeInternals();
   const edges = useEdges();
   const allNodes = useNodes() as Node<FlowNodeData>[];
 
-  const inputs = data.customNodeInputs ?? [];
-  const outputs = data.customNodeOutputs ?? [];
-  const params = data.customNodeParamDefs ?? [];
   const isCueSession = data.customNodeTypeId === "cue.session";
+  const inputs =
+    isCueSession && (data.customNodeInputs?.length ?? 0) === 0
+      ? CUE_SESSION_INPUTS
+      : (data.customNodeInputs ?? []);
+  const outputs =
+    isCueSession && (data.customNodeOutputs?.length ?? 0) === 0
+      ? CUE_SESSION_OUTPUTS
+      : (data.customNodeOutputs ?? []);
+  const params = data.customNodeParamDefs ?? [];
   const visibleParams = isCueSession
     ? params.filter(p => p.ui?.widget !== "cue_hidden")
     : params;
@@ -161,6 +267,12 @@ export function CustomNode({ id, data, selected }: NodeProps<CustomNodeType>) {
       onParamChangeRef.current?.(name, value);
     }, PARAM_PUSH_DEBOUNCE_MS);
   };
+  const setOutputValues = useCallback(
+    (values: Record<string, unknown>) => {
+      updateData({ customNodeOutputValues: values });
+    },
+    [updateData]
+  );
   const displayName =
     data.customTitle ||
     data.customNodeDisplayName ||
@@ -169,10 +281,47 @@ export function CustomNode({ id, data, selected }: NodeProps<CustomNodeType>) {
 
   const { setRowRef, rowPositions } = useHandlePositions([
     collapsed,
+    isCueSession ? "cue-ports-bottom" : "standard-ports",
     unlinkedInputs.map(p => p.name).join("|"),
     outputs.map(p => p.name).join("|"),
     visibleParams.map(p => p.name).join("|"),
   ]);
+  useEffect(() => {
+    requestAnimationFrame(() => updateNodeInternals(id));
+  }, [id, rowPositions, updateNodeInternals]);
+
+  const cuePortRows = isCueSession ? (
+    <div className="grid grid-cols-2 gap-2 rounded-md border border-white/5 bg-[#101010] p-1.5 text-[9px] text-[#9ca3af]">
+      <div className="min-w-0">
+        <div className="mb-1 px-1 uppercase text-[#737373]">In</div>
+        {unlinkedInputs.map(p => (
+          <div
+            key={`in-${p.name}`}
+            ref={setRowRef(`in:${p.name}`)}
+            className="flex h-5 min-w-0 items-center rounded px-1"
+          >
+            <span className="truncate" title={p.description || p.name}>
+              {cueSessionPortLabel(p.name)}
+            </span>
+          </div>
+        ))}
+      </div>
+      <div className="min-w-0 text-right">
+        <div className="mb-1 px-1 uppercase text-[#737373]">Out</div>
+        {outputs.map(p => (
+          <div
+            key={`out-${p.name}`}
+            ref={setRowRef(`out:${p.name}`)}
+            className="flex h-5 min-w-0 items-center justify-end rounded px-1"
+          >
+            <span className="truncate" title={p.description || p.name}>
+              {cueSessionPortLabel(p.name)}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  ) : null;
 
   return (
     <NodeCard
@@ -189,30 +338,34 @@ export function CustomNode({ id, data, selected }: NodeProps<CustomNodeType>) {
       />
       {!collapsed && (
         <NodeBody withGap>
+          {!isCueSession && (
+            <>
+              {unlinkedInputs.map(p => (
+                <div key={`in-${p.name}`} ref={setRowRef(`in:${p.name}`)}>
+                  <NodeParamRow label={p.name}>
+                    <NodePill>{p.name}</NodePill>
+                  </NodeParamRow>
+                </div>
+              ))}
+
+              {outputs.map(p => (
+                <div key={`out-${p.name}`} ref={setRowRef(`out:${p.name}`)}>
+                  <NodeParamRow label={p.name}>
+                    <NodePill>{p.name}</NodePill>
+                  </NodeParamRow>
+                </div>
+              ))}
+            </>
+          )}
+
           {isCueSession && (
             <CueSessionWidget
               data={data}
               params={params}
-              outputs={outputs}
               setParam={setParam}
+              setOutputValues={setOutputValues}
             />
           )}
-
-          {unlinkedInputs.map(p => (
-            <div key={`in-${p.name}`} ref={setRowRef(`in:${p.name}`)}>
-              <NodeParamRow label={p.name}>
-                <NodePill>{p.name}</NodePill>
-              </NodeParamRow>
-            </div>
-          ))}
-
-          {outputs.map(p => (
-            <div key={`out-${p.name}`} ref={setRowRef(`out:${p.name}`)}>
-              <NodeParamRow label={p.name}>
-                <NodePill>{p.name}</NodePill>
-              </NodeParamRow>
-            </div>
-          ))}
 
           {visibleParams.map(p => {
             const connected = upstreamByPort.has(p.name);
@@ -232,6 +385,8 @@ export function CustomNode({ id, data, selected }: NodeProps<CustomNodeType>) {
               </div>
             );
           })}
+
+          {cuePortRows}
         </NodeBody>
       )}
 

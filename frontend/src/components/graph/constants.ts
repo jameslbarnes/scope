@@ -1,6 +1,6 @@
 import type { Node } from "@xyflow/react";
 import type { FlowNodeData } from "../../lib/graphUtils";
-import { parseHandleId } from "../../lib/graphUtils";
+import { parseHandleId, stripCustomNodeDirection } from "../../lib/graphUtils";
 import {
   PARAM_TYPE_COLORS,
   HANDLE_COLORS,
@@ -94,6 +94,9 @@ export function getEdgeColor(
     if (sourceNode.data.nodeType === "prompt_blend") {
       return COLOR_STRING;
     }
+    if (sourceNode.data.nodeType === "text_monitor") {
+      return COLOR_STRING;
+    }
     if (sourceNode.data.nodeType === "subgraph") {
       const port = sourceNode.data.subgraphOutputs?.find(
         p => p.name === parsed.name
@@ -124,6 +127,15 @@ export function getEdgeColor(
   }
   if (sourceNode.data.nodeType === "sink") {
     return HANDLE_COLORS.sink;
+  }
+  if (sourceNode.data.nodeType === "custom_node") {
+    const portName = stripCustomNodeDirection(parsed.name);
+    const port = sourceNode.data.customNodeOutputs?.find(
+      candidate => candidate.name === portName
+    );
+    return port
+      ? PARAM_TYPE_COLORS[port.port_type] || COLOR_DEFAULT
+      : COLOR_DEFAULT;
   }
 
   if (sourceNode.data.nodeType === "subgraph") {

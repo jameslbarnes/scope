@@ -35,6 +35,10 @@ import {
 } from "../lib/schemaSettings";
 import { SchemaPrimitiveField } from "./PrimitiveFields";
 import { useCloudStatus } from "../hooks/useCloudStatus";
+import {
+  ShaderClawPanel,
+  SHADERCLAW_MANAGED_FIELD_KEYS,
+} from "./ShaderClawPanel";
 interface InputAndControlsPanelProps {
   className?: string;
   pipelines: Record<string, PipelineInfo> | null;
@@ -181,6 +185,8 @@ export function InputAndControlsPanel({
   schemaFieldOverrides,
   onSchemaFieldOverrideChange,
 }: InputAndControlsPanelProps) {
+  const isShaderClawPipeline = pipelineId === "shaderclaw-3";
+
   // NDI source discovery
   const [ndiSources, setNdiSources] = useState<DiscoveredSource[]>([]);
   const [isDiscoveringNdi, setIsDiscoveringNdi] = useState(false);
@@ -893,10 +899,27 @@ export function InputAndControlsPanel({
           })()}
         </div>
 
+        {isShaderClawPipeline && (
+          <ShaderClawPanel
+            values={schemaFieldOverrides ?? {}}
+            onChange={onSchemaFieldOverrideChange}
+            disabled={_isPipelineLoading}
+          />
+        )}
+
         {/* Schema-driven input fields (category "input"), below app-defined sections */}
         {configSchema &&
           (() => {
-            const parsedInputFields = parseInputFields(configSchema, inputMode);
+            const parsedInputFields = parseInputFields(
+              configSchema,
+              inputMode
+            ).filter(
+              ({ key }) =>
+                !(
+                  isShaderClawPipeline &&
+                  SHADERCLAW_MANAGED_FIELD_KEYS.has(key)
+                )
+            );
             if (parsedInputFields.length === 0) return null;
             const enumValuesByRef: Record<string, string[]> = {};
             if (configSchema?.$defs) {

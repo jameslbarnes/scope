@@ -162,6 +162,7 @@ export interface FlowNodeData {
     | "prompt_blend"
     | "scheduler"
     | "audio"
+    | "text_monitor"
     | "custom_node";
   availablePipelineIds?: string[];
   /** Declared input ports for the selected pipeline */
@@ -226,6 +227,8 @@ export interface FlowNodeData {
   mathDefaultB?: number;
   /** For note nodes: the note text content */
   noteText?: string;
+  /** For text monitor nodes: latest upstream string value. */
+  textMonitorText?: string;
   /** For output nodes: sink type (spout, ndi, syphon) */
   outputSinkType?: string;
   /** For output nodes: whether the output is enabled */
@@ -471,6 +474,8 @@ export interface FlowNodeData {
   customNodeParams?: Record<string, unknown>;
   /** For custom_node: parameter definitions from API (widget metadata) */
   customNodeParamDefs?: NodeParamDef[];
+  /** For custom_node: latest live output values surfaced by frontend widgets. */
+  customNodeOutputValues?: Record<string, unknown>;
   /** For custom_node: push a param change through to the backend so the
    *  running node picks up the new value without a session restart. */
   onCustomNodeParamChange?: (key: string, value: unknown) => void;
@@ -1165,6 +1170,7 @@ const FRONTEND_ONLY_TYPES = new Set<FlowNodeData["nodeType"]>([
   "tempo",
   "prompt_list",
   "prompt_blend",
+  "text_monitor",
 ]);
 
 /** Fields in FlowNodeData that are non-serializable (functions, streams, etc.) */
@@ -1193,6 +1199,8 @@ const NON_SERIALIZABLE_KEYS = new Set<string>([
   "onRefreshTempoSources",
   "tempoSources",
   "committedValue",
+  "customNodeOutputValues",
+  "textMonitorText",
 ]);
 
 /**

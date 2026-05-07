@@ -85,6 +85,7 @@ class CloudTrack(MediaStreamTrack):
         self.frame_processor = frame_processor
         self._last_frame: VideoFrame | None = None
         self._started = False
+        self._stop_requested = False
         self._first_frame_emitted = False
 
         # Multi-source / multi-sink / record (wired up in _start after cloud connects)
@@ -104,6 +105,8 @@ class CloudTrack(MediaStreamTrack):
 
     async def _start(self) -> None:
         """Start the relay - called on first recv()."""
+        if self._stop_requested or self.readyState != "live":
+            raise MediaStreamError
         if self._started:
             return
 
@@ -216,9 +219,13 @@ class CloudTrack(MediaStreamTrack):
                     logger.info(f"Wired extra sink track {i} to cloud output")
 
             # Wire record node output callbacks (placed after sink tracks)
-            num_extra_sinks = len(self._extra_sink_tracks)
+            num_sink_handlers = (
+                len(self.frame_processor.get_sink_node_ids())
+                if self.frame_processor is not None
+                else 1
+            )
             for i, (rec_id, callback) in enumerate(self._record_callbacks):
-                handler_index = num_extra_sinks + 1 + i
+                handler_index = num_sink_handlers + i
                 if handler_index < len(webrtc_client.output_handlers):
                     webrtc_client.output_handlers[handler_index].add_callback(callback)
                     logger.info(f"Wired record node {rec_id} to cloud output")
@@ -294,10 +301,15 @@ class CloudTrack(MediaStreamTrack):
 
     async def recv(self) -> VideoFrame:
         """Return the next processed frame from cloud."""
+        if self._stop_requested or self.readyState != "live":
+            raise MediaStreamError
+
         # Lazy initialization
         await self._start()
 
         while True:
+            if self._stop_requested or self.readyState != "live":
+                raise MediaStreamError
             if self.frame_processor:
                 frame_packet = self.frame_processor.get_packet()
                 if frame_packet is not None:
@@ -342,8 +354,10 @@ class CloudTrack(MediaStreamTrack):
         """Stop the relay and clean up."""
         logger.info("Stopping...")
 
+        self._stop_requested = True
+        MediaStreamTrack.stop(self)
         self._input_running = False
-        self._started = False  # Reset so next session starts fresh
+        self._started = False
 
         # Stop extra source input handlers and clear all multi-source/sink state
         for handler in self._extra_input_handlers:

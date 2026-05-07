@@ -57,6 +57,7 @@ export function NodeCard({
   if (collapsed) {
     return (
       <div
+        data-node-card="true"
         className={`group bg-[#1e1e1e] border-2 border-transparent rounded-full shadow-[0_1px_4px_rgba(0,0,0,0.25)] relative flex flex-col ${
           selected ? NODE_TOKENS.cardSelected : ""
         } ${className}`}
@@ -71,6 +72,7 @@ export function NodeCard({
   /* Normal card */
   return (
     <div
+      data-node-card="true"
       className={`group ${NODE_TOKENS.card} ${selected ? NODE_TOKENS.cardSelected : ""} ${className}`}
     >
       <NodeResizer

@@ -83,30 +83,44 @@ def test_cue_session_node_definition_exposes_expected_ports():
     definition = CueSessionNode.get_definition()
 
     assert definition.node_type_id == "cue.session"
+    assert definition.display_name == "Cue Director"
     assert definition.continuous is True
     assert {port.name for port in definition.outputs} >= {
         "prompt",
         "reset",
-        "action_json",
+        "action",
+        "param_patch",
+        "shader_patch",
         "transcript",
+        "source",
         "status",
         "tick",
-        "chat_status",
-        "mapping_json",
+        "decision",
     }
     assert {port.name for port in definition.inputs} >= {
         "refresh",
-        "chat_in",
-        "context_json",
+        "transcript",
+        "vision",
+        "signal",
+        "context",
+        "control",
     }
     assert {param.name for param in definition.params} >= {
+        "cue_base_url",
+        "session_id",
         "cue_file_path",
         "cue_file_json",
         "input_mapping_json",
         "output_mapping_json",
         "chat_text",
         "chat_submit_count",
+        "style_tags_json",
     }
+    assert all(
+        param.ui and param.ui.get("widget") == "cue_hidden"
+        for param in definition.params
+        if param.name in {"cue_base_url", "session_id", "action_type", "enabled"}
+    )
 
 
 def test_cue_session_node_polls_state_and_emits_prompt_action():
@@ -123,6 +137,7 @@ def test_cue_session_node_polls_state_and_emits_prompt_action():
         assert outputs["prompt"] == "Blue projected room, camera holds close."
         assert outputs["reset"] is True
         assert outputs["transcript"] == "The room turns blue."
+        assert json.loads(outputs["action"])["type"] == "video.update_prompt"
         assert outputs["decision_count"] == 3
         assert outputs["observation_count"] == 8
         assert outputs["status"] == "ok"
@@ -214,14 +229,14 @@ def test_cue_session_node_forwards_mapped_inputs():
             "poll_interval_ms": 0,
         }
 
-        outputs = node.execute({"chat_in": "Use the blue wall."}, **kwargs)
-        node.execute({"chat_in": "Use the blue wall."}, **kwargs)
+        outputs = node.execute({"transcript": "Use the blue wall."}, **kwargs)
+        node.execute({"transcript": "Use the blue wall."}, **kwargs)
 
-        assert outputs["chat_status"] == "chat_in sent"
+        assert outputs["chat_status"] == "transcript sent"
         assert len(_CueStateHandler.observations) == 1
         observation = _CueStateHandler.observations[0]
         assert observation["type"] == "transcript.segment"
-        assert observation["source"] == "scope.input.chat_in"
+        assert observation["source"] == "scope.input.transcript"
         assert observation["payload"]["text"] == "Use the blue wall."
     finally:
         server.shutdown()

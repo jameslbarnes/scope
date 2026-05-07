@@ -4,6 +4,7 @@ import io
 import json
 import logging
 import os
+import queue
 import subprocess
 import sys
 import threading
@@ -22,7 +23,16 @@ from urllib.parse import quote, urlparse
 import click
 import httpx
 import uvicorn
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    HTTPException,
+    Query,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -127,6 +137,8 @@ from .tempo_router import router as tempo_router
 _pipeline_schemas_cache: PipelineSchemasResponse | None = None
 _node_definitions_cache: NodeDefinitionsResponse | None = None
 _plugins_list_cache: object | None = None
+_local_only_pipeline_load_active = False
+_local_only_pipeline_load_node_ids: set[str] = set()
 
 
 def _invalidate_plugin_caches():
@@ -148,6 +160,116 @@ def _invalidate_plugin_caches():
         get_plugin_manager().clear_update_check_cache()
     except Exception:
         pass
+
+
+def _is_remote_scope_local_only_type(type_id: Any) -> bool:
+    from .remote_scope import is_remote_scope_local_only_node_type
+
+    return is_remote_scope_local_only_node_type(type_id)
+
+
+def _pipeline_load_tuples_from_request(
+    request: PipelineLoadRequest,
+) -> list[tuple[str, str, dict[str, Any] | None]]:
+    if request.pipelines:
+        return [
+            (pipeline.node_id, pipeline.pipeline_id, pipeline.load_params)
+            for pipeline in request.pipelines
+        ]
+    if request.pipeline_ids:
+        return [
+            (pipeline_id, pipeline_id, request.load_params)
+            for pipeline_id in request.pipeline_ids
+        ]
+    raise HTTPException(
+        status_code=400,
+        detail="Either 'pipelines' or 'pipeline_ids' must be provided",
+    )
+
+
+def _split_local_only_pipeline_tuples(
+    pipelines: list[tuple[str, str, dict[str, Any] | None]],
+) -> tuple[
+    list[tuple[str, str, dict[str, Any] | None]],
+    list[tuple[str, str, dict[str, Any] | None]],
+]:
+    local: list[tuple[str, str, dict[str, Any] | None]] = []
+    remote: list[tuple[str, str, dict[str, Any] | None]] = []
+    for item in pipelines:
+        _node_id, pipeline_id, _load_params = item
+        if _is_remote_scope_local_only_type(pipeline_id):
+            local.append(item)
+        else:
+            remote.append(item)
+    return local, remote
+
+
+def _pipeline_load_request_body(request: PipelineLoadRequest) -> dict[str, Any]:
+    return request.model_dump(exclude_none=True)
+
+
+def _plain_dict(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        return value
+    if hasattr(value, "model_dump"):
+        return value.model_dump(exclude_none=True)
+    return None
+
+
+def _initial_parameters_require_remote_scope(initial_parameters: Any) -> bool:
+    """Return true when a WebRTC run contains at least one remote pipeline."""
+    params = _plain_dict(initial_parameters)
+    if params is None:
+        return True
+
+    pipeline_ids = params.get("pipeline_ids")
+    if isinstance(pipeline_ids, list) and pipeline_ids:
+        return any(
+            not _is_remote_scope_local_only_type(pipeline_id)
+            for pipeline_id in pipeline_ids
+        )
+
+    graph = _plain_dict(params.get("graph"))
+    if graph is None:
+        return True
+
+    nodes = graph.get("nodes")
+    if not isinstance(nodes, list):
+        return True
+
+    for node in nodes:
+        node_data = _plain_dict(node)
+        if not isinstance(node_data, dict) or node_data.get("type") != "pipeline":
+            continue
+        if not _is_remote_scope_local_only_type(node_data.get("pipeline_id")):
+            return True
+
+    return False
+
+
+def _local_only_pipeline_status_response(
+    status_info: dict[str, Any],
+) -> PipelineStatusResponse:
+    global _local_only_pipeline_load_active, _local_only_pipeline_load_node_ids
+
+    expected_pipeline_id = next(iter(_local_only_pipeline_load_node_ids), None)
+    if status_info.get("status") == "not_loaded" or (
+        status_info.get("status") == "loaded"
+        and expected_pipeline_id is not None
+        and status_info.get("pipeline_id") not in _local_only_pipeline_load_node_ids
+    ):
+        status_info = {
+            **status_info,
+            "status": "loading",
+            "pipeline_id": expected_pipeline_id,
+            "loading_stage": status_info.get("loading_stage")
+            or "Starting local pipeline...",
+        }
+    elif status_info.get("status") == "error":
+        _local_only_pipeline_load_active = False
+        _local_only_pipeline_load_node_ids = set()
+
+    return PipelineStatusResponse(**status_info)
 
 
 class STUNErrorFilter(logging.Filter):
@@ -611,6 +733,34 @@ class CueObservationProxyRequest(BaseModel):
     observations: list[dict[str, Any]] | None = None
 
 
+class CueSessionProxyRequest(BaseModel):
+    base_url: str = Field(default=CUE_DEFAULT_BASE_URL)
+    timeout_ms: int = Field(default=1000, ge=50, le=30000)
+
+
+SHADERCLAW_DEFAULT_SHADER = "Gradient"
+SHADERCLAW_DEFAULT_WIDTH = 640
+SHADERCLAW_DEFAULT_HEIGHT = 360
+
+
+class ShaderClawBaseRequest(BaseModel):
+    shaders_dir: str | None = Field(default=None)
+    width: int = Field(default=SHADERCLAW_DEFAULT_WIDTH, ge=1, le=4096)
+    height: int = Field(default=SHADERCLAW_DEFAULT_HEIGHT, ge=1, le=4096)
+
+
+class ShaderClawLoadRequest(ShaderClawBaseRequest):
+    shader: str = Field(default=SHADERCLAW_DEFAULT_SHADER)
+    parameters: dict[str, Any] | None = None
+
+
+class ShaderClawParameterRequest(ShaderClawBaseRequest):
+    shader: str = Field(default=SHADERCLAW_DEFAULT_SHADER)
+    parameters: dict[str, Any] | None = None
+    name: str
+    value: Any
+
+
 def _normalize_cue_base_url(base_url: str) -> str:
     parsed = urlparse(base_url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -621,6 +771,13 @@ def _normalize_cue_base_url(base_url: str) -> str:
 def _cue_session_url(base_url: str, session_id: str, route: str) -> str:
     base = _normalize_cue_base_url(base_url)
     return f"{base}/sessions/{quote(session_id, safe='')}/{route}"
+
+
+def _cue_session_ws_url(base_url: str, session_id: str, route: str) -> str:
+    url = _cue_session_url(base_url, session_id, route)
+    if url.startswith("https://"):
+        return "wss://" + url.removeprefix("https://")
+    return "ws://" + url.removeprefix("http://")
 
 
 def _cue_timeout(timeout_ms: int) -> httpx.Timeout:
@@ -695,6 +852,519 @@ async def cue_session_observations(
             return response.json()
     except Exception as exc:
         await _raise_cue_proxy_error(exc)
+
+
+@app.post("/api/v1/cue/sessions/{session_id}/reset")
+async def cue_session_reset(
+    session_id: str,
+    request: CueSessionProxyRequest,
+):
+    """Proxy Cue session reset so the node can match Etherea's reset control."""
+    try:
+        async with httpx.AsyncClient(timeout=_cue_timeout(request.timeout_ms)) as client:
+            response = await client.post(
+                _cue_session_url(request.base_url, session_id, "reset"),
+            )
+            response.raise_for_status()
+            return response.json()
+    except Exception as exc:
+        await _raise_cue_proxy_error(exc)
+
+
+@app.websocket("/api/v1/cue/sessions/{session_id}/events")
+async def cue_session_events(
+    websocket: WebSocket,
+    session_id: str,
+    base_url: str = Query(default=CUE_DEFAULT_BASE_URL),
+    timeout_ms: int = Query(default=1000, ge=50, le=30000),
+):
+    """Proxy Cue's passive event websocket into the desktop UI origin."""
+    await _proxy_cue_websocket(websocket, session_id, "events", base_url, timeout_ms)
+
+
+@app.websocket("/api/v1/cue/sessions/{session_id}/transcription")
+async def cue_session_transcription(
+    websocket: WebSocket,
+    session_id: str,
+    base_url: str = Query(default=CUE_DEFAULT_BASE_URL),
+    timeout_ms: int = Query(default=1000, ge=50, le=30000),
+):
+    """Proxy microphone/audio frames into Cue's transcription websocket."""
+    await _proxy_cue_websocket(
+        websocket,
+        session_id,
+        "transcription",
+        base_url,
+        timeout_ms,
+    )
+
+
+@app.websocket("/api/v1/cue/sessions/{session_id}/vlm")
+async def cue_session_vlm(
+    websocket: WebSocket,
+    session_id: str,
+    base_url: str = Query(default=CUE_DEFAULT_BASE_URL),
+    timeout_ms: int = Query(default=1000, ge=50, le=30000),
+):
+    """Proxy sampled frames into Cue's VLM websocket."""
+    await _proxy_cue_websocket(websocket, session_id, "vlm", base_url, timeout_ms)
+
+
+async def _proxy_cue_websocket(
+    websocket: WebSocket,
+    session_id: str,
+    route: str,
+    base_url: str,
+    timeout_ms: int,
+):
+    await websocket.accept()
+    try:
+        import aiohttp
+
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(
+                _cue_session_ws_url(base_url, session_id, route),
+                timeout=max(timeout_ms, 50) / 1000,
+            ) as cue_ws:
+                async def cue_to_client() -> None:
+                    async for message in cue_ws:
+                        if message.type == aiohttp.WSMsgType.TEXT:
+                            await websocket.send_text(message.data)
+                        elif message.type == aiohttp.WSMsgType.BINARY:
+                            await websocket.send_bytes(message.data)
+                        elif message.type in {
+                            aiohttp.WSMsgType.CLOSE,
+                            aiohttp.WSMsgType.CLOSED,
+                            aiohttp.WSMsgType.ERROR,
+                        }:
+                            break
+
+                async def client_to_cue() -> None:
+                    try:
+                        while True:
+                            message = await websocket.receive()
+                            if message["type"] == "websocket.disconnect":
+                                break
+                            text = message.get("text")
+                            data = message.get("bytes")
+                            if text is not None:
+                                await cue_ws.send_str(text)
+                            elif data is not None:
+                                await cue_ws.send_bytes(data)
+                    except WebSocketDisconnect:
+                        pass
+
+                done, pending = await asyncio.wait(
+                    {
+                        asyncio.create_task(cue_to_client()),
+                        asyncio.create_task(client_to_cue()),
+                    },
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in pending:
+                    task.cancel()
+                for task in done:
+                    task.result()
+    except Exception as exc:
+        with contextlib.suppress(Exception):
+            await websocket.send_json(
+                {"type": "error", "error": f"Cue {route} failed: {exc}"}
+            )
+    finally:
+        with contextlib.suppress(Exception):
+            await websocket.close()
+
+
+_shaderclaw_preview_local = threading.local()
+
+
+def _shaderclaw_library(shaders_dir: str | None = None):
+    try:
+        from scope_shaderclaw_plugin.native_renderer import ShaderLibrary
+    except Exception as exc:
+        raise HTTPException(
+            status_code=404,
+            detail="scope-shaderclaw plugin is not installed in this Scope server",
+        ) from exc
+
+    return ShaderLibrary(shaders_dir)
+
+
+def _shaderclaw_preview_renderer(
+    *,
+    shaders_dir: str | None,
+    width: int,
+    height: int,
+):
+    try:
+        from scope_shaderclaw_plugin.native_renderer import NativeShaderClawRenderer
+    except Exception as exc:
+        raise HTTPException(
+            status_code=404,
+            detail="scope-shaderclaw plugin is not installed in this Scope server",
+        ) from exc
+
+    key = (shaders_dir or "", width, height)
+    renderer = getattr(_shaderclaw_preview_local, "renderer", None)
+    renderer_key = getattr(_shaderclaw_preview_local, "renderer_key", None)
+    if renderer is None or renderer_key != key:
+        renderer = NativeShaderClawRenderer(
+            shaders_dir=shaders_dir,
+            width=width,
+            height=height,
+        )
+        _shaderclaw_preview_local.renderer = renderer
+        _shaderclaw_preview_local.renderer_key = key
+    return renderer
+
+
+def _shaderclaw_http_error(exc: Exception) -> HTTPException:
+    status_code = (
+        502
+        if exc.__class__.__name__ in {"ShaderClawError", "ShaderClawNativeError"}
+        else 500
+    )
+    return HTTPException(status_code=status_code, detail=str(exc))
+
+
+def _shaderclaw_parameters_from_json(value: str) -> dict[str, Any]:
+    if not value.strip():
+        return {}
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid ShaderClaw parameters_json: {exc.msg}",
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="ShaderClaw parameters_json must be a JSON object.",
+        )
+    return parsed
+
+
+def _shaderclaw_mjpeg_frame(jpeg: bytes) -> bytes:
+    return (
+        b"--frame\r\n"
+        b"Content-Type: image/jpeg\r\n"
+        b"Content-Length: "
+        + str(len(jpeg)).encode()
+        + b"\r\n"
+        b"\r\n"
+        + jpeg
+        + b"\r\n"
+    )
+
+
+@app.get("/api/v1/shaderclaw/manifest")
+async def shaderclaw_manifest(
+    shaders_dir: str | None = Query(default=None),
+):
+    """Return ShaderClaw's local shader manifest through the Scope origin."""
+
+    def run():
+        library = _shaderclaw_library(shaders_dir)
+        return {"shaders": library.manifest(), "shaders_dir": str(library.shaders_dir)}
+
+    try:
+        return await asyncio.to_thread(run)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _shaderclaw_http_error(exc) from exc
+
+
+@app.post("/api/v1/shaderclaw/load")
+async def shaderclaw_load(request: ShaderClawLoadRequest):
+    """Load ShaderClaw metadata and return its current parameter metadata."""
+
+    def run():
+        library = _shaderclaw_library(request.shaders_dir)
+        entry = library.resolve_shader(request.shader)
+        return {
+            "entry": {"id": entry.id, "title": entry.title, "file": entry.file},
+            "inputs": library.inputs(entry.file, request.parameters or {}),
+            "shaders_dir": str(library.shaders_dir),
+        }
+
+    try:
+        return await asyncio.to_thread(run)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _shaderclaw_http_error(exc) from exc
+
+
+@app.post("/api/v1/shaderclaw/parameter")
+async def shaderclaw_parameter(request: ShaderClawParameterRequest):
+    """Return parameter metadata after changing one native ShaderClaw value."""
+
+    def run():
+        parameters = dict(request.parameters or {})
+        parameters[request.name] = request.value
+        library = _shaderclaw_library(request.shaders_dir)
+        entry = library.resolve_shader(request.shader)
+        return {
+            "inputs": library.inputs(entry.file, parameters),
+            "shaders_dir": str(library.shaders_dir),
+        }
+
+    try:
+        return await asyncio.to_thread(run)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _shaderclaw_http_error(exc) from exc
+
+
+@app.get("/api/v1/shaderclaw/stream")
+async def shaderclaw_stream(
+    shaders_dir: str | None = Query(default=None),
+    shader: str = Query(default=SHADERCLAW_DEFAULT_SHADER),
+    parameters_json: str = Query(default="{}"),
+    width: int = Query(default=SHADERCLAW_DEFAULT_WIDTH, ge=1, le=4096),
+    height: int = Query(default=SHADERCLAW_DEFAULT_HEIGHT, ge=1, le=4096),
+    fps: int = Query(default=30, ge=1, le=60),
+    quality: int = Query(default=82, ge=30, le=95),
+):
+    """Stream a native ShaderClaw preview as MJPEG without React frame polling."""
+
+    parameters = _shaderclaw_parameters_from_json(parameters_json)
+
+    try:
+        # Validate paths and shader selection before the streaming response starts.
+        _shaderclaw_library(shaders_dir).resolve_shader(shader)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _shaderclaw_http_error(exc) from exc
+
+    frame_queue: queue.Queue[bytes | Exception | None] = queue.Queue(maxsize=2)
+    stop_event = threading.Event()
+
+    def publish(item: bytes | Exception | None) -> None:
+        try:
+            frame_queue.put_nowait(item)
+            return
+        except queue.Full:
+            pass
+        with contextlib.suppress(queue.Empty):
+            frame_queue.get_nowait()
+        with contextlib.suppress(queue.Full):
+            frame_queue.put_nowait(item)
+
+    def produce_frames() -> None:
+        interval = 1.0 / fps
+        try:
+            renderer = _shaderclaw_preview_renderer(
+                shaders_dir=shaders_dir,
+                width=width,
+                height=height,
+            )
+            while not stop_event.is_set():
+                started_at = time.monotonic()
+                jpeg = renderer.render_jpeg(shader, parameters, quality=quality)
+                publish(_shaderclaw_mjpeg_frame(jpeg))
+                elapsed = time.monotonic() - started_at
+                if stop_event.wait(max(0.0, interval - elapsed)):
+                    break
+        except Exception as exc:
+            publish(exc)
+        finally:
+            publish(None)
+
+    producer = threading.Thread(
+        target=produce_frames,
+        name=f"shaderclaw-preview-{shader}",
+        daemon=True,
+    )
+
+    async def stream_frames():
+        producer.start()
+        try:
+            while True:
+                item = await asyncio.to_thread(frame_queue.get)
+                if item is None:
+                    break
+                if isinstance(item, Exception):
+                    logger.warning("ShaderClaw preview stream failed: %s", item)
+                    break
+                yield item
+        except asyncio.CancelledError:
+            pass
+        finally:
+            stop_event.set()
+            await asyncio.to_thread(producer.join, 1.0)
+
+    return StreamingResponse(
+        stream_frames(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+            "Pragma": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.websocket("/api/v1/shaderclaw/ws")
+async def shaderclaw_ws_preview(
+    websocket: WebSocket,
+    shaders_dir: str | None = Query(default=None),
+    shader: str = Query(default=SHADERCLAW_DEFAULT_SHADER),
+    parameters_json: str = Query(default="{}"),
+    width: int = Query(default=SHADERCLAW_DEFAULT_WIDTH, ge=1, le=4096),
+    height: int = Query(default=SHADERCLAW_DEFAULT_HEIGHT, ge=1, le=4096),
+    fps: int = Query(default=30, ge=1, le=60),
+):
+    """Stream raw native ShaderClaw frames to a canvas over a local WebSocket."""
+
+    await websocket.accept()
+    try:
+        parameters = _shaderclaw_parameters_from_json(parameters_json)
+        _shaderclaw_library(shaders_dir).resolve_shader(shader)
+    except Exception as exc:
+        detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+        await websocket.send_json({"type": "error", "error": detail})
+        await websocket.close(code=1003)
+        return
+
+    frame_queue: queue.Queue[bytes | Exception | None] = queue.Queue(maxsize=2)
+    command_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=8)
+    stop_event = threading.Event()
+
+    def publish(item: bytes | Exception | None) -> None:
+        try:
+            frame_queue.put_nowait(item)
+            return
+        except queue.Full:
+            pass
+        with contextlib.suppress(queue.Empty):
+            frame_queue.get_nowait()
+        with contextlib.suppress(queue.Full):
+            frame_queue.put_nowait(item)
+
+    def update_parameters(next_parameters: dict[str, Any]) -> None:
+        try:
+            command_queue.put_nowait(next_parameters)
+            return
+        except queue.Full:
+            pass
+        with contextlib.suppress(queue.Empty):
+            command_queue.get_nowait()
+        with contextlib.suppress(queue.Full):
+            command_queue.put_nowait(next_parameters)
+
+    def produce_frames() -> None:
+        interval = 1.0 / fps
+        current_parameters = dict(parameters)
+        try:
+            renderer = _shaderclaw_preview_renderer(
+                shaders_dir=shaders_dir,
+                width=width,
+                height=height,
+            )
+            while not stop_event.is_set():
+                with contextlib.suppress(queue.Empty):
+                    while True:
+                        current_parameters = command_queue.get_nowait()
+
+                started_at = time.monotonic()
+                publish(renderer.render_rgba_bytes(shader, current_parameters))
+                elapsed = time.monotonic() - started_at
+                if stop_event.wait(max(0.0, interval - elapsed)):
+                    break
+        except Exception as exc:
+            publish(exc)
+        finally:
+            publish(None)
+
+    producer = threading.Thread(
+        target=produce_frames,
+        name=f"shaderclaw-canvas-preview-{shader}",
+        daemon=True,
+    )
+
+    async def send_frames() -> None:
+        await websocket.send_json(
+            {
+                "type": "ready",
+                "format": "rgba",
+                "width": width,
+                "height": height,
+                "fps": fps,
+            }
+        )
+        while True:
+            item = await asyncio.to_thread(frame_queue.get)
+            if item is None:
+                break
+            if isinstance(item, Exception):
+                logger.warning("ShaderClaw canvas preview failed: %s", item)
+                await websocket.send_json({"type": "error", "error": str(item)})
+                break
+            await websocket.send_bytes(item)
+
+    async def receive_commands() -> None:
+        while True:
+            try:
+                message = await websocket.receive_json()
+            except WebSocketDisconnect:
+                break
+            if not isinstance(message, dict):
+                continue
+            if message.get("type") != "parameters":
+                continue
+            next_parameters = message.get("parameters")
+            if isinstance(next_parameters, dict):
+                update_parameters(next_parameters)
+
+    producer.start()
+    tasks = {
+        asyncio.create_task(send_frames()),
+        asyncio.create_task(receive_commands()),
+    }
+    try:
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        for task in done:
+            with contextlib.suppress(WebSocketDisconnect):
+                task.result()
+    finally:
+        stop_event.set()
+        await asyncio.to_thread(producer.join, 1.0)
+        for task in tasks:
+            task.cancel()
+        with contextlib.suppress(Exception):
+            await websocket.close()
+
+
+@app.post("/api/v1/shaderclaw/screenshot")
+async def shaderclaw_screenshot(request: ShaderClawLoadRequest):
+    """Render a native ShaderClaw preview frame through the Scope origin."""
+
+    def run():
+        renderer = _shaderclaw_preview_renderer(
+            shaders_dir=request.shaders_dir,
+            width=request.width,
+            height=request.height,
+        )
+        return {
+            "dataUrl": renderer.render_data_url(
+                request.shader,
+                request.parameters or {},
+            )
+        }
+
+    try:
+        return await asyncio.to_thread(run)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _shaderclaw_http_error(exc) from exc
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -818,7 +1488,6 @@ async def root():
 
 
 @app.post("/api/v1/pipeline/load")
-@cloud_proxy(timeout=60.0)
 async def load_pipeline(
     request: PipelineLoadRequest,
     http_request: Request,
@@ -827,31 +1496,62 @@ async def load_pipeline(
 ):
     """Load one or more pipelines.
 
-    In cloud mode (when connected to cloud), this proxies the request to the
-    cloud-hosted scope backend.
+    In cloud mode, remote pipelines are proxied to the cloud-hosted Scope
+    backend while source-kind plugin pipelines stay on the desktop backend.
     """
+    global _local_only_pipeline_load_active, _local_only_pipeline_load_node_ids
+    del http_request
     try:
         # Normalize to list of (node_id, pipeline_id, load_params) tuples
-        if request.pipelines:
-            pipelines = [
-                (p.node_id, p.pipeline_id, p.load_params) for p in request.pipelines
-            ]
-        elif request.pipeline_ids:
-            # Legacy format: use pipeline_id as node_id
-            pipelines = [
-                (pid, pid, request.load_params) for pid in request.pipeline_ids
-            ]
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail="Either 'pipelines' or 'pipeline_ids' must be provided",
-            )
+        pipelines = _pipeline_load_tuples_from_request(request)
 
         # Pipeline active/available DMX path grouping can change after load/unload.
         # Mark the DMX known-path cache stale so it is rebuilt once on next packet.
         srv = get_dmx_server()
         if srv is not None:
             srv.invalidate_known_paths_cache()
+
+        if getattr(cloud_manager, "is_connected", False):
+            from .remote_scope import filter_remote_scope_pipeline_load_body
+
+            local_pipelines, remote_pipelines = _split_local_only_pipeline_tuples(
+                pipelines
+            )
+            _local_only_pipeline_load_active = bool(
+                local_pipelines and not remote_pipelines
+            )
+            _local_only_pipeline_load_node_ids = (
+                {node_id for node_id, _pipeline_id, _load_params in local_pipelines}
+                if _local_only_pipeline_load_active
+                else set()
+            )
+
+            if local_pipelines:
+                asyncio.create_task(
+                    pipeline_manager.load_pipelines(
+                        local_pipelines,
+                        connection_id=request.connection_id,
+                        connection_info=request.connection_info,
+                        user_id=request.user_id,
+                    )
+                )
+
+            remote_body = filter_remote_scope_pipeline_load_body(
+                _pipeline_load_request_body(request)
+            )
+            if remote_body is not None:
+                await proxy_with_body(
+                    cloud_manager,
+                    method="POST",
+                    path="/api/v1/pipeline/load",
+                    body=remote_body,
+                    timeout=60.0,
+                )
+
+            return {"message": "Pipeline loading initiated successfully"}
+
+        _local_only_pipeline_load_active = False
+        _local_only_pipeline_load_node_ids = set()
 
         # Local mode: start loading in background without blocking
         asyncio.create_task(
@@ -871,7 +1571,6 @@ async def load_pipeline(
 
 
 @app.get("/api/v1/pipeline/status", response_model=PipelineStatusResponse)
-@cloud_proxy()
 async def get_pipeline_status(
     http_request: Request,
     pipeline_manager: "PipelineManager" = Depends(get_pipeline_manager),
@@ -879,11 +1578,29 @@ async def get_pipeline_status(
 ):
     """Get current pipeline status.
 
-    In cloud mode (when connected to cloud), this proxies the request to the
-    cloud-hosted scope backend.
+    In cloud mode, report local status for local-only source plugin loads and
+    proxy remote pipeline status otherwise.
     """
+    del http_request
     try:
+        if (
+            getattr(cloud_manager, "is_connected", False)
+            and not _local_only_pipeline_load_active
+        ):
+            status_info = await proxy_with_body(
+                cloud_manager,
+                method="GET",
+                path="/api/v1/pipeline/status",
+            )
+            return PipelineStatusResponse(**status_info)
+
         status_info = await pipeline_manager.get_status_info_async()
+        if (
+            getattr(cloud_manager, "is_connected", False)
+            and _local_only_pipeline_load_active
+        ):
+            return _local_only_pipeline_status_response(status_info)
+
         return PipelineStatusResponse(**status_info)
     except HTTPException:
         raise
@@ -1358,10 +2075,17 @@ async def handle_webrtc_offer(
     - Local backend can record/manipulate frames
     """
     try:
-        # If connected to cloud, use cloud mode (video flows through backend)
-        if cloud_manager.is_connected:
+        # If connected to cloud, use relay mode only when the graph contains
+        # a remote pipeline. Local-only source plugin graphs run on desktop.
+        if getattr(
+            cloud_manager, "is_connected", False
+        ) and _initial_parameters_require_remote_scope(request.initialParameters):
             logger.info("Using relay mode - video will flow through backend to cloud")
             return await webrtc_manager.handle_offer_with_relay(request, cloud_manager)
+        if getattr(cloud_manager, "is_connected", False):
+            logger.info(
+                "Using local mode for local-only pipeline graph while remote Scope is connected"
+            )
 
         # Local mode: ensure pipeline is loaded before proceeding.
         # Node-only graphs (no pipeline nodes) skip this check — the graph

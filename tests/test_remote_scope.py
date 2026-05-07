@@ -2,6 +2,8 @@ import numpy as np
 import pytest
 from av import VideoFrame
 
+import scope.server.cloud_proxy as cloud_proxy
+import scope.server.remote_scope as remote_scope
 from scope.server.cloud_proxy import (
     _normalize_legacy_longlive_node_definitions,
     _normalize_legacy_longlive_schema,
@@ -10,6 +12,12 @@ from scope.server.graph_schema import GraphConfig
 from scope.server.remote_scope import (
     build_remote_scope_initial_parameters,
     build_remote_scope_output_mapping,
+    build_remote_scope_session_parameters,
+    ensure_remote_scope_graph_output_edges,
+    filter_remote_scope_parameter_update,
+    filter_remote_scope_initial_parameters,
+    filter_remote_scope_pipeline_load_body,
+    is_remote_scope_local_only_models_status_request,
     legacy_pipeline_load_request,
     normalize_remote_scope_url,
     parse_remote_scope_graph,
@@ -180,6 +188,86 @@ def test_legacy_longlive_node_definition_defaults_are_normalized_for_desktop():
     }
 
 
+def test_cloud_node_definitions_keep_local_source_plugins(monkeypatch):
+    monkeypatch.setattr(
+        cloud_proxy,
+        "_local_source_node_definitions",
+        lambda: [
+            {
+                "node_type_id": "cue.session",
+                "display_name": "Cue Director",
+                "category": "cue",
+                "description": "local cue node",
+                "inputs": [{"name": "transcript", "port_type": "string"}],
+                "outputs": [{"name": "reset", "port_type": "boolean"}],
+                "params": [],
+                "continuous": True,
+                "pipeline_meta": None,
+                "plugin_name": "scope-cue",
+            }
+        ],
+    )
+    definitions = {
+        "nodes": [
+            {"node_type_id": "longlive", "pipeline_meta": {}},
+            {
+                "node_type_id": "cue.session",
+                "display_name": "stale cloud cue",
+                "inputs": [],
+                "outputs": [],
+            },
+        ]
+    }
+
+    nodes = _normalize_legacy_longlive_node_definitions(definitions)["nodes"]
+
+    assert [node["node_type_id"] for node in nodes] == ["longlive", "cue.session"]
+    cue = nodes[1]
+    assert cue["display_name"] == "Cue Director"
+    assert cue["outputs"] == [{"name": "reset", "port_type": "boolean"}]
+
+
+def test_cloud_pipeline_schemas_keep_local_source_plugins(monkeypatch):
+    monkeypatch.setattr(
+        cloud_proxy,
+        "_local_source_pipeline_schemas",
+        lambda: {
+            "shaderclaw-3": {
+                "id": "shaderclaw-3",
+                "name": "ShaderClaw 3",
+                "config_schema": {
+                    "properties": {
+                        "shader": {
+                            "default": "Gradient",
+                            "enum": ["Gradient", "Etherea"],
+                        }
+                    }
+                },
+                "plugin_name": "scope-shaderclaw",
+            }
+        },
+    )
+    schemas = {
+        "pipelines": {
+            "longlive": {"config_schema": {"properties": {}}},
+            "shaderclaw-3": {
+                "id": "shaderclaw-3",
+                "name": "stale remote shaderclaw",
+                "plugin_name": "cloud-copy",
+            },
+        }
+    }
+
+    pipelines = _normalize_legacy_longlive_schema(schemas)["pipelines"]
+
+    assert set(pipelines) == {"longlive", "shaderclaw-3"}
+    assert pipelines["shaderclaw-3"]["name"] == "ShaderClaw 3"
+    assert pipelines["shaderclaw-3"]["plugin_name"] == "scope-shaderclaw"
+    assert pipelines["shaderclaw-3"]["config_schema"]["properties"]["shader"][
+        "enum"
+    ] == ["Gradient", "Etherea"]
+
+
 def test_legacy_pipeline_load_request_translates_shared_load_params():
     body = {
         "pipelines": [
@@ -238,6 +326,121 @@ def test_pipeline_load_request_identity_accepts_current_and_legacy_shapes():
     )
 
 
+def test_remote_pipeline_load_filters_local_only_cue_node():
+    body = {
+        "pipelines": [
+            {
+                "node_id": "longlive",
+                "pipeline_id": "longlive",
+                "load_params": {"width": 832, "height": 480},
+            },
+            {
+                "node_id": "cue",
+                "pipeline_id": "cue.session",
+                "load_params": {},
+            },
+        ],
+        "connection_id": "remote-scope-test",
+    }
+
+    assert filter_remote_scope_pipeline_load_body(body) == {
+        "pipelines": [
+            {
+                "node_id": "longlive",
+                "pipeline_id": "longlive",
+                "load_params": {"width": 832, "height": 480},
+            }
+        ],
+        "connection_id": "remote-scope-test",
+    }
+
+
+def test_remote_pipeline_load_filters_local_only_source_plugin(monkeypatch):
+    monkeypatch.setattr(
+        remote_scope,
+        "is_remote_scope_local_only_node_type",
+        lambda value: value in {"cue.session", "shaderclaw-3"},
+    )
+    body = {
+        "pipelines": [
+            {
+                "node_id": "longlive",
+                "pipeline_id": "longlive",
+                "load_params": {"width": 832, "height": 480},
+            },
+            {
+                "node_id": "shader",
+                "pipeline_id": "shaderclaw-3",
+                "load_params": {"shader": "water"},
+            },
+        ],
+        "connection_id": "remote-scope-test",
+    }
+
+    assert filter_remote_scope_pipeline_load_body(body) == {
+        "pipelines": [
+            {
+                "node_id": "longlive",
+                "pipeline_id": "longlive",
+                "load_params": {"width": 832, "height": 480},
+            }
+        ],
+        "connection_id": "remote-scope-test",
+    }
+
+
+def test_remote_pipeline_load_returns_none_for_only_local_source_plugin(monkeypatch):
+    monkeypatch.setattr(
+        remote_scope,
+        "is_remote_scope_local_only_node_type",
+        lambda value: value == "shaderclaw-3",
+    )
+    body = {
+        "pipeline_ids": ["shaderclaw-3"],
+        "load_params": {"shader": "water"},
+    }
+
+    assert filter_remote_scope_pipeline_load_body(body) is None
+
+
+def test_remote_source_plugins_are_local_only(monkeypatch):
+    class FakePluginManager:
+        def get_plugin_for_type_id(self, type_id):
+            return {"shaderclaw-3": "scope-shaderclaw"}.get(type_id)
+
+        def list_plugins_sync(self, *, skip_update_check=False):
+            assert skip_update_check
+            return [
+                {"name": "scope-shaderclaw", "kind": "source"},
+                {"name": "scope-longlive", "kind": None},
+            ]
+
+    import scope.core.plugins as plugins
+
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: FakePluginManager())
+
+    assert remote_scope.is_remote_scope_local_only_node_type("shaderclaw-3")
+    assert not remote_scope.is_remote_scope_local_only_node_type("longlive")
+
+
+def test_remote_pipeline_load_returns_none_for_only_local_nodes():
+    body = {
+        "pipeline_ids": ["cue.session"],
+        "load_params": {},
+    }
+
+    assert filter_remote_scope_pipeline_load_body(body) is None
+
+
+def test_remote_models_status_short_circuits_local_only_cue_node():
+    assert is_remote_scope_local_only_models_status_request(
+        "pipeline_id=cue.session"
+    )
+    assert not is_remote_scope_local_only_models_status_request(
+        "pipeline_id=longlive"
+    )
+
+
 def test_remote_pipeline_status_matches_equivalent_loaded_pipeline():
     requested = pipeline_load_request_identity(
         {
@@ -290,6 +493,287 @@ def test_remote_pipeline_status_rejects_different_resolution():
         },
         requested,
     )
+
+
+def test_remote_initial_parameters_filter_local_only_cue_node_and_edges():
+    params = {
+        "input_mode": "video",
+        "graph": {
+            "nodes": [
+                {"id": "input", "type": "source"},
+                {"id": "cue", "type": "node", "node_type_id": "cue.session"},
+                {"id": "pipe", "type": "pipeline", "pipeline_id": "longlive"},
+                {"id": "out", "type": "sink"},
+            ],
+            "edges": [
+                {
+                    "from": "input",
+                    "from_port": "video",
+                    "to_node": "pipe",
+                    "to_port": "video",
+                    "kind": "stream",
+                },
+                {
+                    "from": "cue",
+                    "from_port": "prompt",
+                    "to_node": "pipe",
+                    "to_port": "prompt",
+                    "kind": "data",
+                },
+                {
+                    "from": "pipe",
+                    "from_port": "video",
+                    "to_node": "out",
+                    "to_port": "video",
+                    "kind": "stream",
+                },
+            ],
+            "ui_state": {
+                "node_params": {
+                    "cue": {"session_id": "demo"},
+                    "pipe": {"width": 832},
+                }
+            },
+        },
+    }
+
+    filtered = filter_remote_scope_initial_parameters(params)
+    assert [node["id"] for node in filtered["graph"]["nodes"]] == [
+        "input",
+        "pipe",
+        "out",
+    ]
+    assert [edge["from"] for edge in filtered["graph"]["edges"]] == [
+        "input",
+        "pipe",
+    ]
+    assert filtered["graph"]["ui_state"]["node_params"] == {"pipe": {"width": 832}}
+
+    runner_params = build_remote_scope_initial_parameters(params)
+    assert [node["id"] for node in runner_params["graph"]["nodes"]] == [
+        "input",
+        "pipe",
+        "out",
+    ]
+    assert runner_params["source_track_order"] == ["input"]
+
+
+def test_remote_initial_parameters_filter_local_only_source_pipeline_and_edges(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        remote_scope,
+        "is_remote_scope_local_only_node_type",
+        lambda value: value in {"shaderclaw-3"},
+    )
+    params = {
+        "input_mode": "text",
+        "graph": {
+            "nodes": [
+                {"id": "shader", "type": "pipeline", "pipeline_id": "shaderclaw-3"},
+                {"id": "pipe", "type": "pipeline", "pipeline_id": "longlive"},
+                {"id": "out", "type": "sink"},
+            ],
+            "edges": [
+                {
+                    "from": "shader",
+                    "from_port": "video",
+                    "to_node": "out",
+                    "to_port": "video",
+                    "kind": "stream",
+                },
+                {
+                    "from": "pipe",
+                    "from_port": "video",
+                    "to_node": "out",
+                    "to_port": "video",
+                    "kind": "stream",
+                },
+            ],
+            "ui_state": {
+                "node_params": {
+                    "shader": {"shader": "water"},
+                    "pipe": {"width": 832},
+                }
+            },
+        },
+    }
+
+    filtered = filter_remote_scope_initial_parameters(params)
+
+    assert [node["id"] for node in filtered["graph"]["nodes"]] == ["pipe", "out"]
+    assert [edge["from"] for edge in filtered["graph"]["edges"]] == ["pipe"]
+    assert filtered["graph"]["ui_state"]["node_params"] == {"pipe": {"width": 832}}
+
+
+def test_remote_initial_parameters_add_output_edge_for_simple_plugin_graph():
+    params = {
+        "input_mode": "text",
+        "graph": {
+            "nodes": [
+                {"id": "longlive", "type": "pipeline", "pipeline_id": "longlive"},
+                {"id": "output", "type": "sink"},
+                {"id": "cue", "type": "node", "node_type_id": "cue.session"},
+            ],
+            "edges": [],
+        },
+    }
+
+    filtered = build_remote_scope_initial_parameters(params)
+
+    assert filtered["graph"]["nodes"] == [
+        {"id": "longlive", "type": "pipeline", "pipeline_id": "longlive"},
+        {"id": "output", "type": "sink"},
+    ]
+    assert filtered["graph"]["edges"] == [
+        {
+            "from": "longlive",
+            "from_port": "video",
+            "to_node": "output",
+            "to_port": "video",
+            "kind": "stream",
+        }
+    ]
+
+
+def test_remote_output_edge_repair_does_not_guess_between_multiple_pipelines():
+    params = {
+        "graph": {
+            "nodes": [
+                {"id": "pipe-a", "type": "pipeline", "pipeline_id": "longlive"},
+                {"id": "pipe-b", "type": "pipeline", "pipeline_id": "longlive"},
+                {"id": "output", "type": "sink"},
+            ],
+            "edges": [],
+        }
+    }
+
+    assert ensure_remote_scope_graph_output_edges(params)["graph"]["edges"] == []
+
+
+def test_remote_output_edge_repair_materializes_sink_to_sink_syphon_tee():
+    params = {
+        "input_mode": "text",
+        "graph": {
+            "nodes": [
+                {"id": "longlive", "type": "pipeline", "pipeline_id": "longlive"},
+                {"id": "output", "type": "sink"},
+                {
+                    "id": "output_sink",
+                    "type": "sink",
+                    "sink_mode": "syphon",
+                    "sink_name": "Scope",
+                },
+            ],
+            "edges": [
+                {
+                    "from_node": "output",
+                    "from_port": "out",
+                    "to_node": "output_sink",
+                    "to_port": "video",
+                    "kind": "stream",
+                },
+            ],
+        },
+    }
+
+    filtered = build_remote_scope_initial_parameters(params)
+    session_params = build_remote_scope_session_parameters(params)
+    edges = filtered["graph"]["edges"]
+    graph = session_params.graph_info
+    mapping = build_remote_scope_output_mapping(graph)
+
+    assert {
+        (edge.get("from", edge.get("from_node")), edge["to_node"])
+        for edge in edges
+    } == {("longlive", "output")}
+    assert [node["id"] for node in filtered["graph"]["nodes"]] == [
+        "longlive",
+        "output",
+    ]
+    assert mapping.num_output_tracks == 1
+    assert mapping.num_local_handlers == 2
+    assert mapping.remote_to_local == [0]
+    assert mapping.sink_tee_pairs == [(0, 1)]
+    assert all(edge.get("from_node") != "output" for edge in edges)
+    assert session_params.runner_params == filtered
+
+
+def test_remote_parameter_update_filters_dedupes_and_collapses_local_sinks():
+    update = {
+        "reset_cache": False,
+        "graph": {
+            "nodes": [
+                {"id": "longlive", "type": "pipeline", "pipeline_id": "longlive"},
+                {"id": "output", "type": "sink"},
+                {
+                    "id": "cue",
+                    "type": "node",
+                    "node_type_id": "cue.session",
+                },
+                {
+                    "id": "output_sink",
+                    "type": "sink",
+                    "sink_mode": "syphon",
+                    "sink_name": "Scope",
+                },
+            ],
+            "edges": [
+                {
+                    "from_node": "cue",
+                    "from_port": "reset",
+                    "to_node": "longlive",
+                    "to_port": "reset_cache",
+                    "kind": "stream",
+                },
+                {
+                    "from_node": "cue",
+                    "from_port": "reset",
+                    "to_node": "longlive",
+                    "to_port": "reset_cache",
+                    "kind": "stream",
+                },
+                {
+                    "from_node": "longlive",
+                    "from_port": "video",
+                    "to_node": "output",
+                    "to_port": "video",
+                    "kind": "stream",
+                },
+                {
+                    "from_node": "longlive",
+                    "from_port": "video",
+                    "to_node": "output",
+                    "to_port": "video",
+                    "kind": "stream",
+                },
+                {
+                    "from_node": "longlive",
+                    "from_port": "video",
+                    "to_node": "output_sink",
+                    "to_port": "video",
+                    "kind": "stream",
+                },
+            ],
+        },
+    }
+
+    filtered = filter_remote_scope_parameter_update(update)
+
+    assert filtered["reset_cache"] is False
+    assert [node["id"] for node in filtered["graph"]["nodes"]] == [
+        "longlive",
+        "output",
+    ]
+    assert filtered["graph"]["edges"] == [
+        {
+            "from_node": "longlive",
+            "from_port": "video",
+            "to_node": "output",
+            "to_port": "video",
+            "kind": "stream",
+        }
+    ]
 
 
 def test_sink_attached_record_is_mirrored_locally():

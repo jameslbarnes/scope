@@ -1,6 +1,9 @@
 // Type resolution utilities for param connections
 import type { Edge, Node } from "@xyflow/react";
-import { parseHandleId } from "../../../lib/graphUtils";
+import {
+  parseHandleId,
+  stripCustomNodeDirection,
+} from "../../../lib/graphUtils";
 import type { FlowNodeData } from "../../../lib/graphUtils";
 
 export type ResolvedType =
@@ -56,6 +59,24 @@ export function resolveSourceType(
   if (nt === "tempo") return "number";
   if (nt === "prompt_list") return "string";
   if (nt === "prompt_blend") return "string";
+  if (nt === "text_monitor") return "string";
+  if (nt === "custom_node") {
+    if (!sourceHandleId) return undefined;
+    const parsed = parseHandleId(sourceHandleId);
+    if (!parsed) return undefined;
+    const portName = stripCustomNodeDirection(parsed.name);
+    const port = node.data.customNodeOutputs?.find(p => p.name === portName);
+    const portType = port?.port_type;
+    if (
+      portType === "string" ||
+      portType === "number" ||
+      portType === "boolean" ||
+      portType === "trigger"
+    ) {
+      return portType;
+    }
+    return undefined;
+  }
   if (nt === "reroute") {
     // Walk upstream — reroutes have at most one input; use the first incoming edge.
     const incomingEdge = edges.find(e => e.target === node.id);
@@ -125,6 +146,7 @@ export function resolveTargetType(
     return undefined;
   }
   if (nt === "reroute") return undefined; // accepts any
+  if (nt === "text_monitor" && targetParamName === "text") return "string";
   if (nt === "pipeline") {
     const param = targetNode.data.parameterInputs?.find(
       p => p.name === targetParamName

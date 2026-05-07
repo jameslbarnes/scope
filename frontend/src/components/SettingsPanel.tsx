@@ -60,6 +60,7 @@ import {
   type SchemaComplexFieldContext,
 } from "./ComplexFields";
 import { SchemaPrimitiveField } from "./PrimitiveFields";
+import { ShaderClawPanel } from "./ShaderClawPanel";
 
 // Minimum dimension for most pipelines (will be overridden by pipeline-specific minDimension from schema)
 const DEFAULT_MIN_DIMENSION = 1;
@@ -411,6 +412,8 @@ export function SettingsPanel({
   nonLinearGraph = false,
   onClearGraph,
 }: SettingsPanelProps) {
+  const isShaderClawPipeline = pipelineId === "shaderclaw-3";
+
   // Local slider state management hooks
   const noiseScaleSlider = useLocalSliderValue(noiseScale, onNoiseScaleChange);
   const kvCacheAttentionBiasSlider = useLocalSliderValue(
@@ -648,6 +651,14 @@ export function SettingsPanel({
               </div>
             </CardContent>
           </Card>
+        )}
+
+        {isShaderClawPipeline && (
+          <ShaderClawPanel
+            values={schemaFieldOverrides ?? {}}
+            onChange={onSchemaFieldOverrideChange}
+            disabled={isLoading || nonLinearGraph}
+          />
         )}
 
         {/* Preprocessor List */}
