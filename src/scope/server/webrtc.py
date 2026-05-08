@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 import uuid
 
 # Type checking imports
@@ -33,11 +34,25 @@ from .livepeer import LivepeerConnection
 from .pipeline_manager import PipelineManager
 from .recording import RecordingManager
 from .schema import WebRTCOfferRequest
+from .stream_telemetry import (
+    STREAM_TELEMETRY_PREFIX,
+    compact_frame_processor_stats,
+    compact_rtp_stats,
+    should_log_telemetry,
+)
 from .tracks import (
     SinkOutputTrack,
     SourceInputHandler,
     VideoProcessingTrack,
 )
+from .webrtc_rtp_stats import RtpStatsSampler
+from .webrtc_turn_relay import (
+    env_flag,
+    force_turn_relay_transport_policy,
+    log_selected_ice_candidate_pairs,
+    prefer_turn_relay_ice_servers,
+)
+from .webrtc_vp8_recovery import configure_vp8_recovery
 
 if TYPE_CHECKING:
     from .scope_cloud_types import ScopeCloudBackend
@@ -46,15 +61,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 WEBRTC_MAX_FRAME_RATE_HINT = int(os.getenv("SCOPE_WEBRTC_MAX_FRAME_RATE_HINT", "30"))
-WEBRTC_DEFAULT_BITRATE = int(os.getenv("SCOPE_WEBRTC_DEFAULT_BITRATE", "18000000"))
-WEBRTC_MIN_BITRATE = int(os.getenv("SCOPE_WEBRTC_MIN_BITRATE", "8000000"))
-WEBRTC_MAX_BITRATE = int(os.getenv("SCOPE_WEBRTC_MAX_BITRATE", "30000000"))
+WEBRTC_DEFAULT_BITRATE = int(os.getenv("SCOPE_WEBRTC_DEFAULT_BITRATE", "8000000"))
+WEBRTC_MIN_BITRATE = int(os.getenv("SCOPE_WEBRTC_MIN_BITRATE", "4000000"))
+WEBRTC_MAX_BITRATE = int(os.getenv("SCOPE_WEBRTC_MAX_BITRATE", "12000000"))
 WEBRTC_PREFER_H264 = os.getenv("SCOPE_WEBRTC_PREFER_H264", "0").strip().lower() not in {
     "0",
     "false",
     "no",
     "off",
 }
+WEBRTC_FORCE_TURN_RELAY = env_flag("SCOPE_WEBRTC_FORCE_TURN_RELAY")
 
 # aiortc's built-in defaults are tuned for ordinary calls, not full-frame AI
 # video. Scope relays remote inference through two WebRTC hops, so keep the
@@ -68,6 +84,7 @@ vpx.MAX_FRAME_RATE = WEBRTC_MAX_FRAME_RATE_HINT
 vpx.DEFAULT_BITRATE = WEBRTC_DEFAULT_BITRATE
 vpx.MIN_BITRATE = WEBRTC_MIN_BITRATE
 vpx.MAX_BITRATE = WEBRTC_MAX_BITRATE
+configure_vp8_recovery()
 
 
 def _prefer_h264_for_video_transceivers(pc: RTCPeerConnection, label: str) -> None:
@@ -231,10 +248,20 @@ class Session:
         # Multi-sink/source support
         self.additional_tracks: list[NodeOutputTrack] = []
         self.input_handlers: list[SourceInputHandler] = []
+        self.rtp_stats_sampler = RtpStatsSampler()
+        self.last_rtp_stats: dict[str, Any] | None = None
+        self.rtp_stats_task: asyncio.Task | None = None
+        self._last_rtp_telemetry_log_at: float | None = None
 
     async def close(self):
         """Close this session and cleanup resources."""
         try:
+            rtp_stats_task = self.rtp_stats_task
+            self.rtp_stats_task = None
+            if rtp_stats_task is not None and not rtp_stats_task.done():
+                rtp_stats_task.cancel()
+                await asyncio.gather(rtp_stats_task, return_exceptions=True)
+
             if self.tempo_sync is not None and self.notification_sender is not None:
                 self.tempo_sync.unregister_notification_session(
                     self.notification_sender
@@ -270,6 +297,49 @@ class Session:
 
     def __str__(self):
         return f"Session({self.id}, state={self.pc.connectionState})"
+
+    def start_rtp_stats_polling(self, label: str) -> None:
+        """Start periodic RTP telemetry sampling for this browser session."""
+        if self.rtp_stats_task is not None and not self.rtp_stats_task.done():
+            return
+        self.rtp_stats_task = asyncio.create_task(self._rtp_stats_loop(label))
+
+    async def _rtp_stats_loop(self, label: str) -> None:
+        try:
+            while self.pc is not None and self.pc.connectionState not in (
+                "closed",
+                "failed",
+            ):
+                try:
+                    report = await self.pc.getStats()
+                    stats = self.rtp_stats_sampler.sample(report)
+                    self.last_rtp_stats = stats
+                    self._maybe_log_rtp_telemetry(label, stats)
+                except Exception as exc:
+                    logger.debug("Session RTP stats sample failed for %s: %s", self.id, exc)
+                await asyncio.sleep(1.0)
+        except asyncio.CancelledError:
+            pass
+
+    def _maybe_log_rtp_telemetry(self, label: str, stats: dict[str, Any]) -> None:
+        now = time.time()
+        if not should_log_telemetry(self._last_rtp_telemetry_log_at, now):
+            return
+        frame_stats = (
+            self.frame_processor.get_frame_stats()
+            if self.frame_processor is not None
+            else None
+        )
+        logger.info(
+            "%s browser_session.rtp label=%s session=%s state=%s rtp=%s frame_processor=%s",
+            STREAM_TELEMETRY_PREFIX,
+            label,
+            self.id,
+            self.pc.connectionState,
+            compact_rtp_stats(stats),
+            compact_frame_processor_stats(frame_stats),
+        )
+        self._last_rtp_telemetry_log_at = now
 
 
 class NotificationSender:
@@ -664,6 +734,8 @@ class WebRTCManager:
                 logger.info(
                     f"Connection state changed to: {pc.connectionState} for session {session.id}"
                 )
+                if pc.connectionState == "connected":
+                    log_selected_ice_candidate_pairs(pc, f"local session {session.id}")
                 if pc.connectionState == "failed":
                     _publish_connection_error(
                         session.id,
@@ -817,10 +889,13 @@ class WebRTCManager:
                 _mark_video_outputs_sendonly(pc, "local")
 
             _prefer_h264_for_video_transceivers(pc, "local")
+            if WEBRTC_FORCE_TURN_RELAY:
+                force_turn_relay_transport_policy(pc, "local")
 
             # Create answer
             answer = await pc.createAnswer()
             await pc.setLocalDescription(answer)
+            session.start_rtp_stats_polling("local")
 
             # Publish session_created event
             pipeline_ids = initial_parameters.get("pipeline_ids")
@@ -1079,6 +1154,10 @@ class WebRTCManager:
                 logger.info(
                     f"Connection state: {pc.connectionState} for session {session.id}"
                 )
+                if pc.connectionState == "connected":
+                    log_selected_ice_candidate_pairs(
+                        pc, f"cloud relay session {session.id}"
+                    )
                 if pc.connectionState == "failed":
                     _publish_connection_error(
                         session.id,
@@ -1222,10 +1301,13 @@ class WebRTCManager:
                 )
 
             _prefer_h264_for_video_transceivers(pc, "cloud relay")
+            if WEBRTC_FORCE_TURN_RELAY:
+                force_turn_relay_transport_policy(pc, "cloud relay")
 
             # Create answer
             answer = await pc.createAnswer()
             await pc.setLocalDescription(answer)
+            session.start_rtp_stats_polling("cloud_relay")
 
             # Publish session_created event for relay mode
             pipeline_ids = initial_parameters.get("pipeline_ids")
@@ -1380,6 +1462,21 @@ class WebRTCManager:
             return "headless", self.headless_session.frame_processor, True
         return None
 
+    async def sample_session_rtp_stats(self) -> dict[str, dict[str, Any]]:
+        """Sample RTP stats for active browser WebRTC sessions."""
+        samples: dict[str, dict[str, Any]] = {}
+        for sid, session in self.sessions.items():
+            if session.pc.connectionState in ("closed", "failed"):
+                continue
+            try:
+                report = await session.pc.getStats()
+            except Exception as exc:
+                logger.debug("Session RTP stats sample failed for %s: %s", sid, exc)
+                continue
+            session.last_rtp_stats = session.rtp_stats_sampler.sample(report)
+            samples[sid] = session.last_rtp_stats
+        return samples
+
     def get_last_frame(self, sink_node_id: str | None = None):
         """Return the most recent frame from the active session, or None.
 
@@ -1473,6 +1570,12 @@ def create_rtc_config() -> RTCConfiguration:
             turn_credentials = get_turn_credentials(method=turn_provider)
 
             ice_servers = credentials_to_rtc_ice_servers(turn_credentials)
+            if WEBRTC_FORCE_TURN_RELAY:
+                ice_servers = prefer_turn_relay_ice_servers(
+                    ice_servers,
+                    relay_only=True,
+                    label="server",
+                )
             logger.info(
                 f"RTCConfiguration created with {turn_provider} and {len(ice_servers)} ICE servers"
             )

@@ -21,10 +21,16 @@ from .media_packets import (
 )
 from .modulation import ModulationEngine
 from .parameter_scheduler import ParameterScheduler
+from .parameter_trace import (
+    PARAMETER_TRACE_PREFIX,
+    parameter_trace_summary,
+    should_trace_parameters,
+)
 from .pipeline_manager import PipelineManager
 from .pipeline_processor import PipelineProcessor
 from .sink_manager import SinkManager
 from .source_manager import SourceManager
+from .stream_telemetry import STREAM_TELEMETRY_PREFIX, compact_frame_processor_stats
 
 if TYPE_CHECKING:
     from .scope_cloud_types import ScopeCloudBackend
@@ -797,6 +803,13 @@ class FrameProcessor:
                     f"Rate: {fps_in:.1f} fps in, {fps_out:.1f} fps out | "
                     f"Pipeline FPS: {pipeline_fps:.1f}"
                 )
+            telemetry_stats = self.get_frame_stats()
+            logger.info(
+                "%s frame_processor.heartbeat session=%s stats=%s",
+                STREAM_TELEMETRY_PREFIX,
+                self.session_id,
+                compact_frame_processor_stats(telemetry_stats),
+            )
 
             # Emit stream_heartbeat Kafka event
             heartbeat_metadata = {
@@ -850,6 +863,11 @@ class FrameProcessor:
         if cloud is not None:
             stats["frames_to_cloud"] = cloud.frames_to_cloud
             stats["frames_from_cloud"] = cloud.frames_from_cloud
+            stats["cloud_relay"] = cloud.get_stats()
+        if self.pipeline_processors:
+            stats["pipeline_processors"] = [
+                processor.get_telemetry() for processor in self.pipeline_processors
+            ]
 
         return stats
 
@@ -879,6 +897,24 @@ class FrameProcessor:
 
     def update_parameters(self, parameters: dict[str, Any]):
         """Update parameters that will be used in the next pipeline call."""
+        trace_summary = (
+            parameter_trace_summary(parameters)
+            if should_trace_parameters(parameters)
+            else None
+        )
+        if trace_summary is not None:
+            logger.info(
+                "%s frame_processor.update session=%s cloud_mode=%s graph_ready=%s "
+                "trace=%s",
+                PARAMETER_TRACE_PREFIX,
+                self.session_id,
+                self._cloud_relay is not None,
+                self._graph_ready,
+                trace_summary,
+            )
+            if self._cloud_relay is not None:
+                self._cloud_relay.trace_parameter_update(trace_summary)
+
         # Always strip tempo-control keys so they never leak into pipelines,
         # even when the corresponding helper (scheduler/engine/tempo_sync) is absent.
 
@@ -933,6 +969,13 @@ class FrameProcessor:
                 k: v for k, v in parameters.items() if k not in BEAT_STATE_KEYS
             }
 
+        # Keep one-shot reset commands out of the long-lived session state. The
+        # command is still forwarded to the processor below, but GET
+        # /session/parameters should report durable state, not a consumed pulse.
+        state_parameters = dict(parameters)
+        reset_cache_update = "reset_cache" in state_parameters
+        state_parameters.pop("reset_cache", None)
+
         # Route to specific node or broadcast to all pipeline processors
         node_id = parameters.pop("node_id", None)
         if node_id:
@@ -950,7 +993,9 @@ class FrameProcessor:
                 processor.update_parameters(parameters)
 
         # Update local parameters
-        self.parameters = {**self.parameters, **parameters}
+        if reset_cache_update:
+            self.parameters.pop("reset_cache", None)
+        self.parameters = {**self.parameters, **state_parameters}
 
         return True
 

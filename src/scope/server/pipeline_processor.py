@@ -21,7 +21,13 @@ from .media_packets import (
     VideoPacket,
     ensure_video_packet,
 )
+from .parameter_trace import (
+    PARAMETER_TRACE_PREFIX,
+    parameter_trace_summary,
+    should_trace_parameters,
+)
 from .pipeline_manager import PipelineNotAvailableException
+from .stream_telemetry import STREAM_TELEMETRY_PREFIX, should_log_telemetry
 from .tempo_sync import get_beat_boundary
 
 logger = logging.getLogger(__name__)
@@ -40,6 +46,10 @@ MIN_FPS = 1.0  # Minimum FPS to prevent division by zero
 MAX_FPS = 60.0  # Maximum FPS cap
 BATCH_FPS_SAMPLE_SIZE = 10  # Number of batch-level samples for windowed averaging
 
+# Prompt/reset updates are state replacements, not a command log. If several arrive
+# while LongLive is in a generation call, only the latest prompt should be rendered.
+LATEST_WINS_PARAMETER_KEYS = frozenset(("prompts", "transition", "reset_cache"))
+
 
 class PipelineProcessor:
     """Processes frames through a single pipeline in a dedicated thread."""
@@ -57,6 +67,7 @@ class PipelineProcessor:
         modulation_engine: Any | None = None,
         node_id: str | None = None,
         notification_callback: Callable[[dict], None] | None = None,
+        on_fatal_error: Callable[[BaseException], None] | None = None,
     ):
         """Initialize a pipeline processor.
 
@@ -72,6 +83,8 @@ class PipelineProcessor:
             modulation_engine: ModulationEngine for beat-synced param modulation
             node_id: Graph node ID (used for per-node parameter routing in graph mode)
             notification_callback: Lets consumers know of parameter updates etc
+            on_fatal_error: Optional callback invoked before the worker stops on
+                non-recoverable errors.
         """
         self.pipeline = pipeline
         self.pipeline_id = pipeline_id
@@ -83,6 +96,7 @@ class PipelineProcessor:
         self.tempo_sync = tempo_sync
         self.modulation_engine = modulation_engine
         self.notification_callback = notification_callback
+        self.on_fatal_error = on_fatal_error
 
         # Port-based queues wired by graph_executor.build_graph()
         self.input_queues: dict[str, queue.Queue] = {}
@@ -136,6 +150,12 @@ class PipelineProcessor:
         # Flag to track pending cache initialization after queue flush
         # Set when reset_cache flushes queues, cleared after successful pipeline call
         self._pending_cache_init = False
+        self._last_parameter_trace: dict[str, Any] | None = None
+        self._last_parameter_trace_applied_at: float | None = None
+        self._trace_first_output_pending = False
+        self._last_telemetry_log_at: float | None = None
+        self._last_batch_telemetry: dict[str, Any] | None = None
+        self._output_frames_dropped = 0
 
         # Beat-synced cache reset: fire init_cache=True at rhythmic intervals
         self._beat_cache_reset_rate: str = "none"
@@ -330,13 +350,87 @@ class PipelineProcessor:
 
     def update_parameters(self, parameters: dict[str, Any]):
         """Update parameters that will be used in the next pipeline call."""
+        trace_summary = (
+            parameter_trace_summary(parameters)
+            if should_trace_parameters(parameters)
+            else None
+        )
+        if trace_summary is not None:
+            logger.info(
+                "%s processor.queue pipeline=%s node=%s qsize_before=%s trace=%s",
+                PARAMETER_TRACE_PREFIX,
+                self.pipeline_id,
+                self.node_id,
+                self.parameters_queue.qsize(),
+                trace_summary,
+            )
         try:
             self.parameters_queue.put_nowait(parameters)
+            return True
         except queue.Full:
-            logger.info(
-                f"Parameter queue full for {self.pipeline_id}, dropping parameter update"
-            )
+            if self._should_coalesce_parameter_update(parameters):
+                coalesced = self._coalesce_parameter_updates(
+                    [*self._drain_parameter_queue(), parameters]
+                )
+                try:
+                    self.parameters_queue.put_nowait(coalesced)
+                    if trace_summary is not None:
+                        logger.warning(
+                            "%s processor.queue_coalesced_full pipeline=%s "
+                            "node=%s trace=%s",
+                            PARAMETER_TRACE_PREFIX,
+                            self.pipeline_id,
+                            self.node_id,
+                            parameter_trace_summary(coalesced),
+                        )
+                    return True
+                except queue.Full:
+                    pass
+            if trace_summary is not None:
+                logger.warning(
+                    "%s processor.queue_full pipeline=%s node=%s trace=%s",
+                    PARAMETER_TRACE_PREFIX,
+                    self.pipeline_id,
+                    self.node_id,
+                    trace_summary,
+                )
+            else:
+                logger.info(
+                    f"Parameter queue full for {self.pipeline_id}, dropping parameter update"
+                )
             return False
+
+    @staticmethod
+    def _should_coalesce_parameter_update(parameters: dict[str, Any]) -> bool:
+        return any(key in parameters for key in LATEST_WINS_PARAMETER_KEYS)
+
+    def _drain_parameter_queue(self) -> list[dict[str, Any]]:
+        drained: list[dict[str, Any]] = []
+        while True:
+            try:
+                drained.append(self.parameters_queue.get_nowait())
+            except queue.Empty:
+                return drained
+
+    @staticmethod
+    def _coalesce_parameter_updates(
+        updates: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        coalesced: dict[str, Any] = {}
+        reset_requested = False
+        for update in updates:
+            if update.get("reset_cache") is True:
+                reset_requested = True
+            coalesced.update(update)
+        if reset_requested:
+            coalesced["reset_cache"] = True
+        return coalesced
+
+    def _get_next_parameter_update(self) -> tuple[dict[str, Any], int] | None:
+        drained = self._drain_parameter_queue()
+        if not drained:
+            return None
+        return self._coalesce_parameter_updates(drained), len(drained)
 
     def worker_loop(self):
         """Main worker loop that processes frames."""
@@ -379,6 +473,15 @@ class PipelineProcessor:
                         },
                         connection_info=self.connection_info,
                     )
+                    if self.on_fatal_error is not None:
+                        try:
+                            self.on_fatal_error(e)
+                        except Exception:
+                            logger.debug(
+                                "Fatal-error callback failed for %s",
+                                self.pipeline_id,
+                                exc_info=True,
+                            )
                     break
 
         logger.info(f"Worker thread stopped for pipeline: {self.pipeline_id}")
@@ -448,8 +551,28 @@ class PipelineProcessor:
     def process_chunk(self):
         """Process a single chunk of frames."""
         # Check if there are new parameters
-        try:
-            new_parameters = self.parameters_queue.get_nowait()
+        next_update = self._get_next_parameter_update()
+        if next_update is not None:
+            new_parameters, coalesced_count = next_update
+            trace_summary = (
+                parameter_trace_summary(new_parameters)
+                if should_trace_parameters(new_parameters)
+                else None
+            )
+            if trace_summary is not None:
+                self._last_parameter_trace = trace_summary
+                self._last_parameter_trace_applied_at = time.time()
+                self._trace_first_output_pending = True
+                logger.info(
+                    "%s processor.apply pipeline=%s node=%s qsize_after=%s "
+                    "coalesced_updates=%s trace=%s",
+                    PARAMETER_TRACE_PREFIX,
+                    self.pipeline_id,
+                    self.node_id,
+                    self.parameters_queue.qsize(),
+                    coalesced_count,
+                    trace_summary,
+                )
             if new_parameters != self.parameters:
                 # Flush stale audio for audio-only pipelines so the new speech
                 # starts immediately. For A/V pipelines, keep audio queued:
@@ -490,8 +613,6 @@ class PipelineProcessor:
 
                 # Merge new parameters with existing ones
                 self.parameters = {**self.parameters, **new_parameters}
-        except queue.Empty:
-            pass
 
         # Pause or resume the processing
         paused = self.parameters.pop("paused", None)
@@ -510,14 +631,26 @@ class PipelineProcessor:
         # Handle reset_cache: clear this processor's output queues
         if reset_cache:
             logger.info(f"Clearing cache for pipeline processor: {self.pipeline_id}")
+            cleared_frames = 0
             for queues in self.output_queues.values():
                 for q in queues:
                     while not q.empty():
                         try:
                             q.get_nowait()
+                            cleared_frames += 1
                         except queue.Empty:
                             break
             self._pending_cache_init = True
+            if self._last_parameter_trace is not None:
+                logger.info(
+                    "%s processor.reset_cache pipeline=%s node=%s "
+                    "cleared_frames=%s trace=%s",
+                    PARAMETER_TRACE_PREFIX,
+                    self.pipeline_id,
+                    self.node_id,
+                    cleared_frames,
+                    self._last_parameter_trace,
+                )
 
         # Drain non-video input ports (string, number, …) into parameters so
         # upstream nodes — e.g. a PromptEnhancer feeding a string port — can
@@ -578,6 +711,7 @@ class PipelineProcessor:
             call_params["init_cache"] = not self.is_prepared or self._pending_cache_init
             if reset_cache:
                 call_params["init_cache"] = True
+            init_cache_requested = bool(call_params.get("init_cache"))
 
             # Pass lora_scales only when present
             if lora_scales is not None:
@@ -601,6 +735,7 @@ class PipelineProcessor:
 
             if self.tempo_sync is not None:
                 call_params = self._apply_tempo_sync(call_params)
+                init_cache_requested = bool(call_params.get("init_cache"))
 
             processing_start = time.time()
             output_dict = self.pipeline(**call_params)
@@ -665,6 +800,7 @@ class PipelineProcessor:
                 num_frames = output.shape[0]
 
             # Put each output port's frames to its queues (all frame ports are streamed)
+            dropped_frames_this_batch = 0
             for port, value in output_dict.items():
                 if value is None or not isinstance(value, torch.Tensor):
                     continue
@@ -723,6 +859,8 @@ class PipelineProcessor:
                                     )
                                 )
                         except queue.Full:
+                            dropped_frames_this_batch += 1
+                            self._output_frames_dropped += 1
                             logger.debug(
                                 f"Output queue full for {self.pipeline_id} port '{port}', dropping frame"
                             )
@@ -738,6 +876,30 @@ class PipelineProcessor:
             # Track batch-level throughput for FPS calculation
             if output is not None and num_frames > 0:
                 self._track_output_batch(num_frames, processing_time)
+                self._record_batch_telemetry(
+                    call_params=call_params,
+                    processing_time=processing_time,
+                    num_frames=num_frames,
+                    init_cache_requested=init_cache_requested,
+                    reset_cache_requested=bool(reset_cache),
+                    dropped_frames_this_batch=dropped_frames_this_batch,
+                )
+                if self._trace_first_output_pending:
+                    elapsed_ms = self._trace_elapsed_ms()
+                    logger.info(
+                        "%s processor.output_batch pipeline=%s node=%s "
+                        "elapsed_ms=%s processing_ms=%s frames=%s queue_sizes=%s "
+                        "trace=%s",
+                        PARAMETER_TRACE_PREFIX,
+                        self.pipeline_id,
+                        self.node_id,
+                        elapsed_ms,
+                        round(processing_time * 1000, 1),
+                        num_frames,
+                        self._output_queue_sizes(),
+                        self._last_parameter_trace,
+                    )
+                    self._trace_first_output_pending = False
 
             # Forward extra params (non-video outputs without queues) to downstream
             # pipelines. Preprocessors may return e.g. {"video": frames,
@@ -838,6 +1000,76 @@ class PipelineProcessor:
             self._last_batch_time = now
 
         self._calculate_output_fps()
+
+    def _trace_elapsed_ms(self) -> float | None:
+        if self._last_parameter_trace_applied_at is None:
+            return None
+        return round((time.time() - self._last_parameter_trace_applied_at) * 1000, 1)
+
+    def _output_queue_sizes(self) -> dict[str, list[int]]:
+        return {
+            port: [q.qsize() for q in queues]
+            for port, queues in self.output_queues.items()
+        }
+
+    def _input_queue_sizes(self) -> dict[str, int]:
+        with self.input_queue_lock:
+            return {port: q.qsize() for port, q in self.input_queues.items()}
+
+    def _record_batch_telemetry(
+        self,
+        *,
+        call_params: dict[str, Any],
+        processing_time: float,
+        num_frames: int,
+        init_cache_requested: bool,
+        reset_cache_requested: bool,
+        dropped_frames_this_batch: int,
+    ) -> None:
+        processing_ms = round(processing_time * 1000, 1)
+        production_fps = (
+            round(num_frames / processing_time, 1) if processing_time > 0 else None
+        )
+        telemetry = {
+            "pipeline": self.pipeline_id,
+            "node": self.node_id,
+            "processing_ms": processing_ms,
+            "frames": num_frames,
+            "production_fps": production_fps,
+            "playback_fps": round(self.get_fps(), 1),
+            "init_cache": init_cache_requested,
+            "reset_cache": reset_cache_requested,
+            "kv_cache_attention_bias": call_params.get("kv_cache_attention_bias"),
+            "input_queue_sizes": self._input_queue_sizes(),
+            "output_queue_sizes": self._output_queue_sizes(),
+            "dropped_frames_batch": dropped_frames_this_batch,
+            "dropped_frames_total": self._output_frames_dropped,
+        }
+        self._last_batch_telemetry = telemetry
+
+        now = time.time()
+        if (
+            init_cache_requested
+            or reset_cache_requested
+            or dropped_frames_this_batch > 0
+            or should_log_telemetry(self._last_telemetry_log_at, now)
+        ):
+            logger.info("%s pipeline.batch %s", STREAM_TELEMETRY_PREFIX, telemetry)
+            self._last_telemetry_log_at = now
+
+    def get_telemetry(self) -> dict[str, Any]:
+        """Return current queue and last-batch telemetry for this processor."""
+        return {
+            "pipeline": self.pipeline_id,
+            "node": self.node_id,
+            "current_output_fps": round(self.get_fps(), 1),
+            "input_queue_sizes": self._input_queue_sizes(),
+            "output_queue_sizes": self._output_queue_sizes(),
+            "dropped_frames_total": self._output_frames_dropped,
+            "last_batch": dict(self._last_batch_telemetry)
+            if self._last_batch_telemetry is not None
+            else None,
+        }
 
     def _calculate_output_fps(self):
         """Calculate FPS from batch-level throughput: sum(frames) / sum(intervals)."""

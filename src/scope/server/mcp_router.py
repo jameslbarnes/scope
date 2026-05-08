@@ -14,8 +14,14 @@ from pydantic import BaseModel, model_validator
 
 if TYPE_CHECKING:
     from .pipeline_manager import PipelineManager
+    from .scope_cloud_types import ScopeCloudBackend
     from .webrtc import WebRTCManager
 
+from .parameter_trace import (
+    PARAMETER_TRACE_PREFIX,
+    parameter_trace_summary,
+    should_trace_parameters,
+)
 from .schema import Parameters
 
 logger = logging.getLogger(__name__)
@@ -40,6 +46,12 @@ def _get_pipeline_manager() -> "PipelineManager":
     return pipeline_manager
 
 
+def _get_scope_cloud() -> "ScopeCloudBackend":
+    from .app import get_scope_cloud
+
+    return get_scope_cloud()
+
+
 # ---------------------------------------------------------------------------
 # Parameter Control
 # ---------------------------------------------------------------------------
@@ -59,6 +71,18 @@ async def update_session_parameters(
     if not params_dict:
         raise HTTPException(status_code=400, detail="No parameters provided")
 
+    trace_summary = (
+        parameter_trace_summary(params_dict)
+        if should_trace_parameters(params_dict)
+        else None
+    )
+    if trace_summary is not None:
+        logger.info(
+            "%s api.receive route=/api/v1/session/parameters trace=%s",
+            PARAMETER_TRACE_PREFIX,
+            trace_summary,
+        )
+
     # Copy before broadcast_parameter_update which mutates params_dict
     # (frame_processor.update_parameters pops node_id).
     notification_params = dict(params_dict)
@@ -67,6 +91,12 @@ async def update_session_parameters(
     webrtc_manager.broadcast_notification(
         {"type": "parameters_updated", "parameters": notification_params}
     )
+    if trace_summary is not None:
+        logger.info(
+            "%s api.broadcasted route=/api/v1/session/parameters trace=%s",
+            PARAMETER_TRACE_PREFIX,
+            trace_summary,
+        )
 
     return {"status": "ok", "applied_parameters": notification_params}
 
@@ -166,6 +196,7 @@ async def stream_headless_output_ts(
 @router.get("/session/metrics")
 async def get_session_metrics(
     webrtc_manager: "WebRTCManager" = Depends(_get_webrtc_manager),
+    cloud_manager: "ScopeCloudBackend" = Depends(_get_scope_cloud),
 ):
     """Get performance metrics from the active session.
 
@@ -173,14 +204,24 @@ async def get_session_metrics(
     usage when CUDA is available.
     """
     session_stats = {}
-    result = webrtc_manager.get_frame_processor()
-    if result:
-        sid, fp, is_headless = result
-        if not (is_headless and not fp.running):
+    rtp_stats = await webrtc_manager.sample_session_rtp_stats()
+    for sid, session in webrtc_manager.list_sessions().items():
+        if session.pc.connectionState in ("closed", "failed"):
+            continue
+        fp = session.frame_processor
+        stats = fp.get_frame_stats() if fp is not None else {}
+        stats["connection_state"] = session.pc.connectionState
+        stats["ice_connection_state"] = session.pc.iceConnectionState
+        stats["webrtc_rtp"] = rtp_stats.get(sid) or session.last_rtp_stats
+        session_stats[sid] = stats
+    if webrtc_manager.headless_session is not None:
+        fp = webrtc_manager.headless_session.frame_processor
+        if fp is not None and fp.running:
             stats = fp.get_frame_stats()
-            if is_headless:
-                stats["headless"] = True
-            session_stats[sid] = stats
+            stats["headless"] = True
+            session_stats["headless"] = stats
+    for sid, sample in rtp_stats.items():
+        session_stats.setdefault(sid, {})["webrtc_rtp"] = sample
 
     gpu_info = {}
     try:
@@ -203,6 +244,7 @@ async def get_session_metrics(
 
     return {
         "sessions": session_stats,
+        "cloud": cloud_manager.get_status(),
         "gpu": gpu_info,
     }
 

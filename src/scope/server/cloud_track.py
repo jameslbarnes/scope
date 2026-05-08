@@ -18,13 +18,18 @@ import fractions
 import logging
 import time
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from aiortc import MediaStreamTrack
 from aiortc.mediastreams import VIDEO_CLOCK_RATE, VIDEO_TIME_BASE, MediaStreamError
 from av import VideoFrame
 
 from .media_packets import ensure_video_packet
+from .parameter_trace import (
+    PARAMETER_TRACE_PREFIX,
+    parameter_trace_summary,
+    should_trace_parameters,
+)
 
 if TYPE_CHECKING:
     from .frame_processor import FrameProcessor
@@ -87,6 +92,9 @@ class CloudTrack(MediaStreamTrack):
         self._started = False
         self._stop_requested = False
         self._first_frame_emitted = False
+        self._last_parameter_trace: dict[str, Any] | None = None
+        self._last_parameter_trace_started_at: float | None = None
+        self._frames_to_trace_to_browser = 0
 
         # Multi-source / multi-sink / record (wired up in _start after cloud connects)
         # Store (source_node_id, track). Resolving to a cloud input track index
@@ -331,18 +339,51 @@ class CloudTrack(MediaStreamTrack):
                         frame.time_base = time_base
 
                     self._last_frame = frame
+                    if self._frames_to_trace_to_browser > 0:
+                        self._frames_to_trace_to_browser -= 1
+                        elapsed_ms = self._trace_elapsed_ms()
+                        logger.info(
+                            "%s cloud_track.frame_to_browser "
+                            "frames_after_update=%s elapsed_ms=%s pts=%s "
+                            "time_base=%s trace=%s",
+                            PARAMETER_TRACE_PREFIX,
+                            5 - self._frames_to_trace_to_browser,
+                            elapsed_ms,
+                            frame.pts,
+                            frame.time_base,
+                            self._last_parameter_trace,
+                        )
                     return frame
 
             await asyncio.sleep(0.01)
 
     def update_parameters(self, params: dict) -> None:
         """Update pipeline parameters on cloud."""
+        trace_summary = (
+            parameter_trace_summary(params) if should_trace_parameters(params) else None
+        )
+        if trace_summary is not None:
+            self._last_parameter_trace = trace_summary
+            self._last_parameter_trace_started_at = time.time()
+            self._frames_to_trace_to_browser = 5
+            logger.info(
+                "%s cloud_track.update session=%s trace=%s",
+                PARAMETER_TRACE_PREFIX,
+                self.session_id,
+                trace_summary,
+            )
+
         # Send to cloud first
         self.cloud_manager.send_parameters(params)
 
         # Handle local concerns (Spout/NDI settings) via FrameProcessor
         if self.frame_processor:
             self.frame_processor.update_parameters(params)
+
+    def _trace_elapsed_ms(self) -> float | None:
+        if self._last_parameter_trace_started_at is None:
+            return None
+        return round((time.time() - self._last_parameter_trace_started_at) * 1000, 1)
 
     def pause(self, paused: bool) -> None:
         """Pause/unpause the relay."""

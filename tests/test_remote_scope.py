@@ -1,3 +1,6 @@
+import asyncio
+import copy
+
 import numpy as np
 import pytest
 from av import VideoFrame
@@ -14,8 +17,8 @@ from scope.server.remote_scope import (
     build_remote_scope_output_mapping,
     build_remote_scope_session_parameters,
     ensure_remote_scope_graph_output_edges,
-    filter_remote_scope_parameter_update,
     filter_remote_scope_initial_parameters,
+    filter_remote_scope_parameter_update,
     filter_remote_scope_pipeline_load_body,
     is_remote_scope_local_only_models_status_request,
     legacy_pipeline_load_request,
@@ -774,6 +777,57 @@ def test_remote_parameter_update_filters_dedupes_and_collapses_local_sinks():
             "kind": "stream",
         }
     ]
+
+
+def test_remote_parameter_updates_post_over_http_with_latest_wins(monkeypatch):
+    async def run_test():
+        connection = remote_scope.RemoteScopeConnection()
+        connection._connected = True
+        connection._base_url = "https://remote.example"
+        connection._loop = asyncio.get_running_loop()
+
+        calls = []
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        second_done = asyncio.Event()
+
+        async def fake_api_request(method, path, body=None, timeout=None):
+            calls.append((method, path, copy.deepcopy(body), timeout))
+            if len(calls) == 1:
+                first_started.set()
+                await release_first.wait()
+            if len(calls) == 2:
+                second_done.set()
+            return {"status": 200, "data": {"applied_parameters": body or {}}}
+
+        monkeypatch.setattr(connection, "api_request", fake_api_request)
+
+        connection.send_parameters(
+            {"prompts": [{"text": "old", "weight": 100}], "node_id": "longlive"}
+        )
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+
+        connection.send_parameters(
+            {"prompts": [{"text": "middle", "weight": 100}], "node_id": "longlive"}
+        )
+        connection.send_parameters(
+            {"prompts": [{"text": "new", "weight": 100}], "node_id": "longlive"}
+        )
+        await asyncio.sleep(0)
+
+        release_first.set()
+        await asyncio.wait_for(second_done.wait(), timeout=1)
+        await asyncio.sleep(0)
+
+        assert [call[1] for call in calls] == [
+            "/api/v1/session/parameters",
+            "/api/v1/session/parameters",
+        ]
+        assert [call[2]["prompts"][0]["text"] for call in calls] == ["old", "new"]
+        assert calls[0][3] == 10.0
+        assert calls[1][3] == 10.0
+
+    asyncio.run(run_test())
 
 
 def test_sink_attached_record_is_mirrored_locally():

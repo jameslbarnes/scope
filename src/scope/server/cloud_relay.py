@@ -7,6 +7,7 @@ cloud-specific state across its own fields.
 
 import logging
 import queue
+import time
 from collections.abc import Callable
 from fractions import Fraction
 
@@ -15,7 +16,9 @@ import torch
 from av import AudioFrame, VideoFrame
 
 from .media_packets import AudioPacket, MediaTimestamp, VideoPacket
+from .parameter_trace import PARAMETER_TRACE_PREFIX
 from .scope_cloud_types import ScopeCloudBackend
+from .stream_telemetry import STREAM_TELEMETRY_PREFIX, should_log_telemetry
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +135,26 @@ class CloudRelay:
         # Counters
         self.frames_to_cloud = 0
         self.frames_from_cloud = 0
+        self._last_parameter_trace: dict | None = None
+        self._last_parameter_trace_started_at: float | None = None
+        self._frames_to_trace_from_cloud = 0
+        self._frames_to_trace_to_browser = 0
+        self._frames_dropped_from_cloud_queue = 0
+        self._last_telemetry_log_at: float | None = None
+
+    def trace_parameter_update(self, trace: dict) -> None:
+        """Trace the next few relay frames after a prompt/reset update."""
+        self._last_parameter_trace = dict(trace)
+        self._last_parameter_trace_started_at = time.time()
+        self._frames_to_trace_from_cloud = 5
+        self._frames_to_trace_to_browser = 5
+        logger.info(
+            "%s cloud_relay.trace_start queue_size=%s frames_from_cloud=%s trace=%s",
+            PARAMETER_TRACE_PREFIX,
+            self._frame_queue.qsize(),
+            self.frames_from_cloud,
+            self._last_parameter_trace,
+        )
 
     # ------------------------------------------------------------------
     # Configuration
@@ -201,6 +224,22 @@ class CloudRelay:
         self.frames_from_cloud += 1
         if self.frames_from_cloud == 1:
             logger.info("[CLOUD-RELAY] First frame received from cloud")
+        queue_before = self._frame_queue.qsize()
+        dropped_oldest = False
+        if self._frames_to_trace_from_cloud > 0:
+            self._frames_to_trace_from_cloud -= 1
+            elapsed_ms = self._trace_elapsed_ms()
+            logger.info(
+                "%s cloud_relay.frame_received frames_after_update=%s "
+                "elapsed_ms=%s queue_before=%s pts=%s time_base=%s trace=%s",
+                PARAMETER_TRACE_PREFIX,
+                5 - self._frames_to_trace_from_cloud,
+                elapsed_ms,
+                queue_before,
+                frame.pts,
+                frame.time_base,
+                self._last_parameter_trace,
+            )
         try:
             frame_np = frame.to_ndarray(format="rgb24")
             try:
@@ -218,6 +257,8 @@ class CloudRelay:
             except queue.Full:
                 try:
                     self._frame_queue.get_nowait()
+                    dropped_oldest = True
+                    self._frames_dropped_from_cloud_queue += 1
                     self._frame_queue.put_nowait(
                         VideoPacket(
                             tensor=torch.from_numpy(frame_np),
@@ -231,6 +272,11 @@ class CloudRelay:
                     )
                 except queue.Empty:
                     pass
+            self._maybe_log_telemetry(
+                event="frame_received",
+                queue_before=queue_before,
+                dropped_oldest=dropped_oldest,
+            )
         except Exception as e:
             logger.error(f"Error processing frame from cloud: {e}")
 
@@ -289,9 +335,25 @@ class CloudRelay:
     def get_frame(self) -> VideoPacket | None:
         """Get the next video frame received from cloud, or None."""
         try:
-            return self._frame_queue.get_nowait()
+            packet = self._frame_queue.get_nowait()
         except queue.Empty:
             return None
+        if self._frames_to_trace_to_browser > 0:
+            self._frames_to_trace_to_browser -= 1
+            elapsed_ms = self._trace_elapsed_ms()
+            logger.info(
+                "%s cloud_relay.frame_dequeued frames_after_update=%s "
+                "elapsed_ms=%s queue_after=%s pts=%s time_base=%s trace=%s",
+                PARAMETER_TRACE_PREFIX,
+                5 - self._frames_to_trace_to_browser,
+                elapsed_ms,
+                self._frame_queue.qsize(),
+                packet.timestamp.pts,
+                packet.timestamp.time_base,
+                self._last_parameter_trace,
+            )
+        self._maybe_log_telemetry(event="frame_dequeued")
+        return packet
 
     def get_audio(self) -> AudioPacket | None:
         """Get the next audio packet received from cloud, or None."""
@@ -313,3 +375,33 @@ class CloudRelay:
         """Unregister callbacks from the cloud manager."""
         self._cloud_manager.remove_frame_callback(self.on_frame_from_cloud)
         self._cloud_manager.remove_audio_callback(self.on_audio_from_cloud)
+
+    def _trace_elapsed_ms(self) -> float | None:
+        if self._last_parameter_trace_started_at is None:
+            return None
+        return round((time.time() - self._last_parameter_trace_started_at) * 1000, 1)
+
+    def get_stats(self) -> dict:
+        """Return cloud relay queue counters for diagnostics."""
+        return {
+            "frame_queue_size": self._frame_queue.qsize(),
+            "frame_queue_maxsize": self._frame_queue.maxsize,
+            "audio_queue_size": self._audio_queue.qsize(),
+            "audio_queue_maxsize": self._audio_queue.maxsize,
+            "frames_dropped_from_cloud_queue": self._frames_dropped_from_cloud_queue,
+        }
+
+    def _maybe_log_telemetry(self, event: str, **extra) -> None:
+        now = time.time()
+        if extra.get("dropped_oldest") or should_log_telemetry(
+            self._last_telemetry_log_at,
+            now,
+        ):
+            logger.info(
+                "%s cloud_relay.%s stats=%s extra=%s",
+                STREAM_TELEMETRY_PREFIX,
+                event,
+                self.get_stats(),
+                extra,
+            )
+            self._last_telemetry_log_at = now

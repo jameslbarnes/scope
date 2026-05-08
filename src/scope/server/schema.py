@@ -855,6 +855,10 @@ class CloudConnectionStats(BaseModel):
         default=0.0,
         description="Recent cloud-to-local processed video frame receive rate",
     )
+    webrtc_rtp: dict[str, Any] | None = Field(
+        default=None,
+        description="Cached aiortc RTP statistics for the cloud media peer connection",
+    )
 
 
 class CloudStatusResponse(BaseModel):

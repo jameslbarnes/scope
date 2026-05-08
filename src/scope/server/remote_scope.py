@@ -35,8 +35,27 @@ from av import AudioFrame, VideoFrame
 
 from .cloud_relay import AudioOutputHandler, FrameOutputHandler
 from .logs_config import set_connection_id
+from .parameter_trace import (
+    PARAMETER_TRACE_PREFIX,
+    parameter_trace_summary,
+    should_trace_parameters,
+)
+from .stream_telemetry import (
+    STREAM_TELEMETRY_PREFIX,
+    compact_rtp_stats,
+    should_log_telemetry,
+)
+from .webrtc_rtp_stats import RtpStatsSampler
+from .webrtc_turn_relay import (
+    env_flag,
+    force_turn_relay_transport_policy,
+    log_selected_ice_candidate_pairs,
+    prefer_turn_relay_ice_servers,
+)
+from .webrtc_vp8_recovery import configure_vp8_recovery
 
 logger = logging.getLogger(__name__)
+configure_vp8_recovery()
 
 REMOTE_SCOPE_URL_ENV = "SCOPE_REMOTE_SCOPE_URL"
 REMOTE_SCOPE_API_KEY_ENV = "SCOPE_REMOTE_SCOPE_API_KEY"
@@ -44,12 +63,24 @@ REMOTE_SCOPE_REQUEST_TIMEOUT_S = 30.0
 REMOTE_SCOPE_VIDEO_NOISE_SCALE_DEFAULT = 0.7
 REMOTE_SCOPE_LOCAL_ONLY_NODE_TYPES = {"cue.session"}
 REMOTE_SCOPE_LOCAL_ONLY_PLUGIN_KIND = "source"
-REMOTE_SCOPE_PREFER_H264 = os.getenv("SCOPE_WEBRTC_PREFER_H264", "0").strip().lower() not in {
-    "0",
-    "false",
-    "no",
-    "off",
-}
+REMOTE_SCOPE_PREFER_H264 = (
+    os.getenv(
+        "SCOPE_REMOTE_SCOPE_PREFER_H264",
+        os.getenv("SCOPE_WEBRTC_PREFER_H264", "1"),
+    )
+    .strip()
+    .lower()
+    not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+)
+REMOTE_SCOPE_FORCE_TURN_RELAY = env_flag(
+    "SCOPE_REMOTE_SCOPE_FORCE_TURN_RELAY",
+    os.getenv("SCOPE_WEBRTC_FORCE_TURN_RELAY", "0"),
+)
 
 
 @dataclass(slots=True)
@@ -96,6 +127,9 @@ class RemoteScopeInputTrack(VideoStreamTrack):
         self._queue: asyncio.Queue[VideoFrame] = asyncio.Queue(maxsize=2)
         self._frame_ptime = 1.0 / fps if fps > 0 else 1.0 / 30.0
         self._pts = 0
+        self._frames_enqueued = 0
+        self._frames_dequeued = 0
+        self._frames_dropped = 0
 
     def put_frame(self, frame: VideoFrame | np.ndarray) -> bool:
         if self.readyState != "live":
@@ -106,10 +140,13 @@ class RemoteScopeInputTrack(VideoStreamTrack):
         def enqueue() -> None:
             try:
                 self._queue.put_nowait(frame)
+                self._frames_enqueued += 1
             except asyncio.QueueFull:
                 try:
                     self._queue.get_nowait()
+                    self._frames_dropped += 1
                     self._queue.put_nowait(frame)
+                    self._frames_enqueued += 1
                 except asyncio.QueueEmpty:
                     pass
 
@@ -123,10 +160,20 @@ class RemoteScopeInputTrack(VideoStreamTrack):
         if self.readyState != "live":
             raise MediaStreamError
         frame = await self._queue.get()
+        self._frames_dequeued += 1
         self._pts += int(self._frame_ptime * VIDEO_CLOCK_RATE)
         frame.pts = self._pts
         frame.time_base = VIDEO_TIME_BASE
         return frame
+
+    def get_stats(self) -> dict[str, int]:
+        return {
+            "queue_size": self._queue.qsize(),
+            "queue_maxsize": self._queue.maxsize,
+            "frames_enqueued": self._frames_enqueued,
+            "frames_dequeued": self._frames_dequeued,
+            "frames_dropped": self._frames_dropped,
+        }
 
 
 def _prefer_h264_for_video_transceivers(pc: RTCPeerConnection, label: str) -> None:
@@ -176,6 +223,18 @@ class RemoteScopeConnection:
         self._media_connected = False
         self._media_tasks: list[asyncio.Task] = []
         self._pending_parameters: list[dict[str, Any]] = []
+        self._pending_http_parameters: dict[str, Any] | None = None
+        self._parameter_post_task: asyncio.Task | None = None
+        self._parameter_post_trace: dict[str, Any] | None = None
+        self._parameter_post_started_at: float | None = None
+        self._last_parameter_trace: dict[str, Any] | None = None
+        self._last_parameter_http_done_at: float | None = None
+        self._frames_to_trace_after_parameter = 0
+        self._rtp_stats_sampler = RtpStatsSampler()
+        self._rtp_stats_task: asyncio.Task | None = None
+        self._last_rtp_stats: dict[str, Any] | None = None
+        self._last_pli_sent_at: dict[int, float] = {}
+        self._last_rtp_telemetry_log_at: float | None = None
         self._stats = {
             "connected_at": None,
             "api_requests_sent": 0,
@@ -335,6 +394,8 @@ class RemoteScopeConnection:
             self._pc.addTransceiver("audio", direction="recvonly")
 
         _prefer_h264_for_video_transceivers(self._pc, "remote Scope")
+        if REMOTE_SCOPE_FORCE_TURN_RELAY:
+            force_turn_relay_transport_policy(self._pc, "remote Scope")
 
         video_output_index = 0
 
@@ -362,6 +423,8 @@ class RemoteScopeConnection:
         async def on_connectionstatechange():
             state = self._pc.connectionState if self._pc is not None else "closed"
             logger.info("Remote Scope WebRTC connection state: %s", state)
+            if state == "connected" and self._pc is not None:
+                log_selected_ice_candidate_pairs(self._pc, "remote Scope")
             if state in {"failed", "closed"}:
                 self._media_connected = False
                 self._last_close_reason = f"WebRTC {state}"
@@ -395,8 +458,16 @@ class RemoteScopeConnection:
             len(self.input_tracks),
             mapping.num_output_tracks,
         )
+        self._start_rtp_stats_polling()
+        if self._pending_http_parameters is not None:
+            self._start_next_parameter_post()
 
     async def stop_webrtc(self) -> None:
+        rtp_stats_task = self._rtp_stats_task
+        self._rtp_stats_task = None
+        if rtp_stats_task is not None and not rtp_stats_task.done():
+            rtp_stats_task.cancel()
+            await asyncio.gather(rtp_stats_task, return_exceptions=True)
         tasks = list(self._media_tasks)
         self._media_tasks.clear()
         for task in tasks:
@@ -416,9 +487,11 @@ class RemoteScopeConnection:
         self._data_channel = None
         self._remote_session_id = None
         self._media_connected = False
+        self._pending_parameters.clear()
         self.source_node_to_track_index = {}
         self.output_handlers = [FrameOutputHandler()]
         self.audio_output_handler = AudioOutputHandler()
+        self._last_rtp_stats = None
 
     async def disconnect(self) -> None:
         if self._connect_task is not None and not self._connect_task.done():
@@ -428,6 +501,12 @@ class RemoteScopeConnection:
             except (asyncio.CancelledError, Exception):
                 pass
         self._connect_task = None
+        self._pending_http_parameters = None
+        parameter_post_task = self._parameter_post_task
+        self._parameter_post_task = None
+        if parameter_post_task is not None and not parameter_post_task.done():
+            parameter_post_task.cancel()
+            await asyncio.gather(parameter_post_task, return_exceptions=True)
         await self.stop_webrtc()
         self._connected = False
         self._connecting = False
@@ -461,13 +540,28 @@ class RemoteScopeConnection:
         if not self.is_connected:
             return
         params = filter_remote_scope_parameter_update(params)
-        if self._data_channel is None or self._data_channel.readyState != "open":
-            self._pending_parameters.append(copy.deepcopy(params))
-            return
+        trace_summary = (
+            parameter_trace_summary(params) if should_trace_parameters(params) else None
+        )
+        if trace_summary is not None:
+            logger.info(
+                "%s remote.send_parameters connected=%s webrtc_connected=%s trace=%s",
+                PARAMETER_TRACE_PREFIX,
+                self.is_connected,
+                self.webrtc_connected,
+                trace_summary,
+            )
         if self._loop is None:
+            self._pending_http_parameters = copy.deepcopy(params)
+            if trace_summary is not None:
+                logger.info(
+                    "%s remote.http_post.buffered reason=no_loop trace=%s",
+                    PARAMETER_TRACE_PREFIX,
+                    trace_summary,
+                )
             return
         try:
-            self._loop.call_soon_threadsafe(self._send_parameters_now, params)
+            self._loop.call_soon_threadsafe(self._queue_http_parameter_update, params)
         except RuntimeError:
             logger.debug("Remote Scope event loop closed before parameter send")
 
@@ -560,6 +654,8 @@ class RemoteScopeConnection:
         stats["frames_received_from_cloud_fps"] = round(
             self._recent_fps(self._received_frame_times), 1
         )
+        stats["webrtc_rtp"] = copy.deepcopy(self._last_rtp_stats)
+        stats["input_tracks"] = [track.get_stats() for track in self.input_tracks]
         return {
             "connected": self.is_connected,
             "connecting": self._connecting,
@@ -576,6 +672,86 @@ class RemoteScopeConnection:
             "last_close_reason": self._last_close_reason,
             "stats": stats if self.is_connected else None,
         }
+
+    def _start_rtp_stats_polling(self) -> None:
+        if self._rtp_stats_task is not None and not self._rtp_stats_task.done():
+            return
+        self._rtp_stats_task = asyncio.create_task(self._rtp_stats_loop())
+
+    async def _rtp_stats_loop(self) -> None:
+        try:
+            while self._pc is not None:
+                try:
+                    report = await self._pc.getStats()
+                    stats = self._rtp_stats_sampler.sample(report)
+                    self._last_rtp_stats = stats
+                    self._maybe_log_rtp_telemetry(stats)
+                    await self._request_keyframes_for_packet_loss(stats)
+                except Exception as exc:
+                    logger.debug("Remote Scope RTP stats sample failed: %s", exc)
+                await asyncio.sleep(1.0)
+        except asyncio.CancelledError:
+            pass
+
+    async def _request_keyframes_for_packet_loss(self, stats: dict[str, Any]) -> None:
+        if self._pc is None:
+            return
+        for stream in stats.get("streams", []):
+            if stream.get("direction") != "inbound" or stream.get("kind") != "video":
+                continue
+            recent = stream.get("recent") or {}
+            recent_lost = int(recent.get("packets_lost") or 0)
+            if recent_lost <= 0:
+                continue
+            ssrc = stream.get("ssrc")
+            if ssrc is None:
+                continue
+            await self._request_video_keyframe(int(ssrc), recent_lost)
+
+    async def _request_video_keyframe(self, media_ssrc: int, lost_packets: int) -> None:
+        if self._pc is None:
+            return
+        now = time.time()
+        last_sent_at = self._last_pli_sent_at.get(media_ssrc, 0.0)
+        if now - last_sent_at < 0.5:
+            return
+        self._last_pli_sent_at[media_ssrc] = now
+
+        sent = 0
+        for receiver in self._pc.getReceivers():
+            track = getattr(receiver, "track", None)
+            if getattr(track, "kind", None) != "video":
+                continue
+            send_pli = getattr(receiver, "_send_rtcp_pli", None)
+            if send_pli is None:
+                continue
+            try:
+                await send_pli(media_ssrc)
+                sent += 1
+            except Exception as exc:
+                logger.debug("Remote Scope PLI request failed: %s", exc)
+        if sent:
+            logger.info(
+                "Requested remote Scope video keyframe after packet loss "
+                "(ssrc=%s lost_packets=%s receivers=%s)",
+                media_ssrc,
+                lost_packets,
+                sent,
+            )
+
+    def _maybe_log_rtp_telemetry(self, stats: dict[str, Any]) -> None:
+        now = time.time()
+        if not should_log_telemetry(self._last_rtp_telemetry_log_at, now):
+            return
+        logger.info(
+            "%s remote_scope.rtp sent_fps=%s received_fps=%s rtp=%s input_tracks=%s",
+            STREAM_TELEMETRY_PREFIX,
+            round(self._recent_fps(self._sent_frame_times), 1),
+            round(self._recent_fps(self._received_frame_times), 1),
+            compact_rtp_stats(stats),
+            [track.get_stats() for track in self.input_tracks],
+        )
+        self._last_rtp_telemetry_log_at = now
 
     async def _health_check(self) -> None:
         if not self._base_url:
@@ -603,6 +779,12 @@ class RemoteScopeConnection:
                     )
                 )
             if ice_servers:
+                if REMOTE_SCOPE_FORCE_TURN_RELAY:
+                    ice_servers = prefer_turn_relay_ice_servers(
+                        ice_servers,
+                        relay_only=True,
+                        label="remote Scope",
+                    )
                 return ice_servers
         except Exception as e:
             logger.warning("Remote ICE server fetch failed, using STUN fallback: %s", e)
@@ -635,7 +817,22 @@ class RemoteScopeConnection:
             while True:
                 frame = await track.recv()
                 self._stats["frames_received_from_cloud"] += 1
-                self._received_frame_times.append(time.time())
+                received_at = time.time()
+                self._received_frame_times.append(received_at)
+                if self._frames_to_trace_after_parameter > 0:
+                    self._frames_to_trace_after_parameter -= 1
+                    elapsed_ms = self._trace_elapsed_ms(received_at)
+                    logger.info(
+                        "%s remote.frame_received handler=%s frames_after_post=%s "
+                        "elapsed_ms=%s pts=%s time_base=%s trace=%s",
+                        PARAMETER_TRACE_PREFIX,
+                        local_handler_index,
+                        5 - self._frames_to_trace_after_parameter,
+                        elapsed_ms,
+                        frame.pts,
+                        frame.time_base,
+                        self._last_parameter_trace,
+                    )
                 if 0 <= local_handler_index < len(self.output_handlers):
                     self.output_handlers[local_handler_index].handle_frame(frame)
         except asyncio.CancelledError:
@@ -658,6 +855,122 @@ class RemoteScopeConnection:
         if self._data_channel is None or self._data_channel.readyState != "open":
             return
         self._data_channel.send(json.dumps(params))
+
+    def _queue_http_parameter_update(self, params: dict[str, Any]) -> None:
+        if not self.is_connected:
+            return
+        self._pending_http_parameters = copy.deepcopy(params)
+        trace_summary = (
+            parameter_trace_summary(params) if should_trace_parameters(params) else None
+        )
+        if trace_summary is not None:
+            logger.info(
+                "%s remote.http_post.queued in_flight=%s pending_latest=True "
+                "trace=%s",
+                PARAMETER_TRACE_PREFIX,
+                self._parameter_post_task is not None
+                and not self._parameter_post_task.done(),
+                trace_summary,
+            )
+        if (
+            self._parameter_post_task is not None
+            and not self._parameter_post_task.done()
+        ):
+            return
+        self._start_next_parameter_post()
+
+    def _start_next_parameter_post(self) -> None:
+        if not self.is_connected or self._pending_http_parameters is None:
+            return
+        params = self._pending_http_parameters
+        self._pending_http_parameters = None
+        self._parameter_post_trace = (
+            parameter_trace_summary(params) if should_trace_parameters(params) else None
+        )
+        self._parameter_post_started_at = time.time()
+        if self._parameter_post_trace is not None:
+            logger.info(
+                "%s remote.http_post.start trace=%s",
+                PARAMETER_TRACE_PREFIX,
+                self._parameter_post_trace,
+            )
+        self._parameter_post_task = asyncio.create_task(
+            self._post_session_parameters(params)
+        )
+        self._parameter_post_task.add_done_callback(self._on_parameter_post_done)
+
+    def _on_parameter_post_done(self, task: asyncio.Task) -> None:
+        if self._parameter_post_task is task:
+            self._parameter_post_task = None
+        trace_summary = self._parameter_post_trace
+        started_at = self._parameter_post_started_at
+        self._parameter_post_trace = None
+        self._parameter_post_started_at = None
+        if task.cancelled():
+            return
+        elapsed_ms = (
+            round((time.time() - started_at) * 1000, 1)
+            if started_at is not None
+            else None
+        )
+        try:
+            response = task.result()
+        except Exception as exc:
+            logger.warning(
+                "%s remote.http_post.failed elapsed_ms=%s error=%s trace=%s",
+                PARAMETER_TRACE_PREFIX,
+                elapsed_ms,
+                exc,
+                trace_summary,
+            )
+        else:
+            status = response.get("status", 500)
+            if status >= 400:
+                logger.warning(
+                    "%s remote.http_post.rejected status=%s elapsed_ms=%s "
+                    "response=%s trace=%s",
+                    PARAMETER_TRACE_PREFIX,
+                    status,
+                    elapsed_ms,
+                    response,
+                    trace_summary,
+                )
+            else:
+                if trace_summary is not None:
+                    self._last_parameter_trace = trace_summary
+                    self._last_parameter_http_done_at = time.time()
+                    self._frames_to_trace_after_parameter = 5
+                    logger.info(
+                        "%s remote.http_post.done status=%s elapsed_ms=%s "
+                        "applied_keys=%s trace=%s",
+                        PARAMETER_TRACE_PREFIX,
+                        status,
+                        elapsed_ms,
+                        sorted(
+                            response.get("data", {}).get("applied_parameters", {})
+                        ),
+                        trace_summary,
+                    )
+                else:
+                    logger.debug(
+                        "Posted remote Scope parameters over HTTP: keys=%s",
+                        sorted(response.get("data", {}).get("applied_parameters", {})),
+                    )
+        self._start_next_parameter_post()
+
+    async def _post_session_parameters(self, params: dict[str, Any]) -> dict[str, Any]:
+        return await self.api_request(
+            "POST",
+            "/api/v1/session/parameters",
+            body=params,
+            timeout=min(REMOTE_SCOPE_REQUEST_TIMEOUT_S, 10.0),
+        )
+
+    def _trace_elapsed_ms(self, now: float | None = None) -> float | None:
+        if self._last_parameter_http_done_at is None:
+            return None
+        now = time.time() if now is None else now
+        return round((now - self._last_parameter_http_done_at) * 1000, 1)
 
     def _headers(self) -> dict[str, str]:
         headers = {"User-Agent": "Scope RemoteScopeConnection"}
